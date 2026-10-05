@@ -490,6 +490,32 @@ func TestPackageManagerLibDir(t *testing.T) {
 		require.NoError(t, m.Close())
 	})
 
+	for name, decline := range map[string]term.Event{
+		"no":      {Type: term.EventKey, Ch: 'N'},
+		"dismiss": {Type: term.EventKey, Key: term.KeyEsc},
+	} {
+		t.Run("declining with "+name+" is not asked again", func(t *testing.T) {
+			t.Parallel()
+
+			rm := idepkgtest.NewReleaseManager(pkgs, bundles)
+			m := newTestWorkspaceManagerHandlerForPkgManager(t, rm, false, 0)
+			defer func() { require.NoError(t, m.Close()) }()
+
+			it, err := m.pkgmanager.LibDir(context.Background(), "go")
+			require.NoError(t, err)
+			m.Resize(40, 15)
+			require.Contains(t, handlertest.DrawHandler(m, 40, 15), "Do you want to install")
+			m.Handle(decline)
+			_, err = iterator.ToSlice(context.Background(), it)
+			require.ErrorIs(t, err, storageapi.ErrNotFound)
+
+			it, err = m.pkgmanager.LibDir(context.Background(), "go")
+			assert.Nil(t, it)
+			require.ErrorIs(t, err, storageapi.ErrNotFound)
+			assert.NotContains(t, handlertest.DrawHandler(m, 40, 15), "Do you want to install")
+		})
+	}
+
 	t.Run("onboarding inactive keeps prompting", func(t *testing.T) {
 		t.Parallel()
 
@@ -729,7 +755,7 @@ func TestPkgManagerPromptsForHost(t *testing.T) {
 			defer func() { require.NoError(t, m.Close()) }()
 
 			host := newHostPackageManager("2")
-			pm := newPkgManager(host, "studio", m.notifications.current(),
+			pm := newPkgManager(host, "studio", m.pkgmanager.pkg, m.notifications.current(),
 				storageapi.WithPartition(m.ideStorage, idepkg.StoragePartition),
 				m.workspaceManagerHandler, m.scheduleNextTick,
 				term.NopInterrupter(), false)

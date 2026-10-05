@@ -25,6 +25,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/extensionapi"
+	"github.com/unstablebuild/rune-go-sdk/api/pkgapi"
 	"github.com/unstablebuild/rune-go-sdk/api/semanticapi"
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
 	"github.com/unstablebuild/rune-go-sdk/api/textapi"
@@ -54,6 +55,7 @@ func NewExtension() (extensionapi.WorkspaceExtension, extensionapi.Metadata) {
 			extensionapi.PermissionSyntaxTree,
 			extensionapi.PermissionStorage,
 			extensionapi.PermissionBrowserWindowManager,
+			extensionapi.PermissionPackages,
 		),
 	}
 	return ext, meta
@@ -92,7 +94,7 @@ func (e *pyExtension) extendWorkspaceWith(
 	notify browserapi.Notifications,
 	lsp semanticapi.LSP,
 	editor textapi.Editor,
-	inst installer,
+	inst langext.Installer,
 	cfg config.Config,
 	dataDir string,
 	storage storageapi.Service,
@@ -107,8 +109,19 @@ func (e *pyExtension) extendWorkspaceWith(
 		return fmt.Errorf("resolve cwd uri: %w", err)
 	}
 	setting := newEnvSetting(storage)
+	init := langext.NewInitializer(ctx, fs, editor, inst, langext.ProjectConfig{
+		LanguageID:  "python",
+		Markers:     pyMarkers,
+		FileMatch:   isPythonFile,
+		WatchEvents: pyWatchEvents(cfg, notify),
+		Tools:       []string{"uv", "uvx", "ty", "ruff"},
+		InitRoot: func(ctx context.Context, root langext.Root, tools *langext.Tools) error {
+			return initializeProjectRoot(
+				ctx, fs, exec, notify, lsp, tools, cfg, dataDir, setting, wm, root)
+		},
+	})
 	syncEnv := func(ctx context.Context, root langext.Root) error {
-		return setupManagedEnvironment(ctx, fs, exec, notify, inst, cfg, dataDir, root)
+		return setupManagedEnvironment(ctx, fs, exec, notify, init.Tools(), cfg, dataDir, root)
 	}
 	manual, handler := newPyHandler(pyHandlerConfig{
 		exec: exec, notify: notify, fs: fs,
@@ -118,16 +131,6 @@ func (e *pyExtension) extendWorkspaceWith(
 		return fmt.Errorf("register python command: %w", err)
 	}
 
-	init := langext.NewInitializer(ctx, fs, editor, langext.ProjectConfig{
-		LanguageID:  "python",
-		Markers:     pyMarkers,
-		FileMatch:   isPythonFile,
-		WatchEvents: pyWatchEvents(cfg, notify),
-		InitRoot: func(ctx context.Context, root langext.Root) error {
-			return initializeProjectRoot(
-				ctx, fs, exec, notify, lsp, inst, cfg, dataDir, setting, wm, root)
-		},
-	})
 	if err := init.Start(); err != nil {
 		return fmt.Errorf("subscribe python open events: %w", err)
 	}
@@ -178,7 +181,7 @@ func initializeProjectRoot(
 	exec workspaceapi.Executor,
 	notify browserapi.Notifications,
 	lsp semanticapi.LSP,
-	inst installer,
+	tools *langext.Tools,
 	cfg config.Config,
 	dataDir string,
 	setting *envSetting,
@@ -191,7 +194,7 @@ func initializeProjectRoot(
 			managed, "root", root.Dir, "uri", root.URI)
 		if managed {
 			if err := setupManagedEnvironment(
-				ctx, fs, exec, notify, inst, cfg, dataDir, root); err != nil {
+				ctx, fs, exec, notify, tools, cfg, dataDir, root); err != nil {
 				_, _ = notify.Notify(browserapi.LevelWarn,
 					"Python environment setup failed, continuing without a synced env: %v", err)
 				slog.Warn("python env setup failed", "root", root.Dir, "error", err)
@@ -203,15 +206,18 @@ func initializeProjectRoot(
 		}
 	}
 
-	tyBin := resolvePyTool(ctx, fs, exec, inst, "ty")
-	ruffBin := resolvePyTool(ctx, fs, exec, inst, "ruff")
 	logLevel := pyLogLevel(cfg, notify)
-	command := pyCommand(tyBin, "ty", "server")
-	alternates := map[string]string{
-		"textDocument/formatting":      pyRuffCommand(ruffBin, logLevel),
-		"textDocument/rangeFormatting": pyRuffCommand(ruffBin, logLevel),
+	command, alternates := readPyOverrides(cfg, notify)
+	if command == "" {
+		command = pyCommand(findTool(ctx, tools, notify, "ty"), "ty", "server")
+		if alternates == nil {
+			ruff := pyRuffCommand(findTool(ctx, tools, notify, "ruff"), logLevel)
+			alternates = map[string]string{
+				"textDocument/formatting":      ruff,
+				"textDocument/rangeFormatting": ruff,
+			}
+		}
 	}
-	command, alternates = applyPyConfig(cfg, notify, command, alternates)
 
 	diagnosticMode := pyDiagnosticMode(cfg, notify)
 	params, err := pyInitializeParams(
@@ -224,6 +230,22 @@ func initializeProjectRoot(
 	}
 	slog.Info("python lsp initialized", "root", root.Dir, "command", command)
 	return nil
+}
+
+// findTool returns the name the python package ships, or "" so the
+// caller uses the one on the host's PATH. A package that ended up not
+// installed has already been explained to the user; any other miss is
+// worth a warning.
+func findTool(
+	ctx context.Context, tools *langext.Tools, notify browserapi.Notifications, name string,
+) string {
+	bin, err := tools.Find(ctx, name)
+	if err != nil && !errors.Is(err, pkgapi.ErrNotInstalled) {
+		_, _ = notify.NotifyOnce(browserapi.LevelWarn,
+			"Could not find %s in the python package: %v. Using the %s on PATH instead.",
+			name, err, name)
+	}
+	return bin
 }
 
 // managedEnvironmentAllowed resolves the stored policy for root, asking
@@ -264,14 +286,14 @@ func setupManagedEnvironment(
 	fs workspaceapi.FileSystem,
 	exec workspaceapi.Executor,
 	notify browserapi.Notifications,
-	inst installer,
+	tools *langext.Tools,
 	cfg config.Config,
 	dataDir string,
 	root langext.Root,
 ) error {
 	kind := detectProjectAt(ctx, fs, root.Dir)
-	uvBin := resolvePyTool(ctx, fs, exec, inst, "uv")
-	envErr := ensureEnvironment(ctx, uvBin, exec, notify, kind, fs, root.Dir, dataDir)
+	uv := findTool(ctx, tools, notify, "uv")
+	envErr := ensureEnvironment(ctx, uv, exec, notify, kind, fs, root.Dir, dataDir)
 
 	if dataDir != "" {
 		if err := pyshim.Write(fs, dataDir); err != nil {
@@ -280,9 +302,9 @@ func setupManagedEnvironment(
 	}
 
 	if pin := debugpyPin(cfg, notify); pin != "" {
-		uvxBin := resolvePyTool(ctx, fs, exec, inst, "uvx")
+		uvx := findTool(ctx, tools, notify, "uvx")
 		go debug.CapturePanicReport(func() {
-			prewarmDebugpy(ctx, uvxBin, exec, root.Dir, pin)
+			prewarmDebugpy(ctx, uvx, exec, root.Dir, pin)
 		})
 	}
 	return envErr
@@ -352,25 +374,23 @@ func prewarmDebugpy(
 	}
 }
 
-// applyPyConfig overrides the ty/ruff defaults with the optional
-// top-level `command` and `alternate_commands` config keys, each applied
-// independently. Overriding `command` without supplying
-// `alternate_commands` drops the default ruff alternates, since they
-// assume the ty+ruff split; supply `alternate_commands` to keep a
-// multi-server setup. Invalid values warn and leave the default in place.
-func applyPyConfig(
+// readPyOverrides reads the optional top-level `command` and
+// `alternate_commands` config keys, returning "" and nil for the ones
+// not set. The caller keeps the ty/ruff defaults for those, except that
+// overriding `command` without supplying `alternate_commands` drops the
+// default ruff alternates, since they assume the ty+ruff split. Invalid
+// values warn and count as not set.
+func readPyOverrides(
 	cfg config.Config, notify browserapi.Notifications,
-	command string, alternates map[string]string,
-) (string, map[string]string) {
+) (command string, alternates map[string]string) {
 	if cfg == nil {
-		return command, alternates
+		return "", nil
 	}
 
 	override, err := cfg.GetString("command")
 	switch {
 	case err == nil && override != "":
 		command = override
-		alternates = nil
 	case err != nil && !errors.Is(err, config.ErrNotFound):
 		_, _ = notify.Notify(browserapi.LevelWarn,
 			"extensions.python.config.command must be a string: %v", err)

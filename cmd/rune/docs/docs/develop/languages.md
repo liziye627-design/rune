@@ -150,8 +150,6 @@ time. The files worth understanding first are:
   which builds the LSP initialization request.
 - [`env.go`](https://github.com/unstablebuild/rune/blob/main/cmd/extension_python/env.go),
   which recognizes Python projects and prepares their environment.
-- [`lookup.go`](https://github.com/unstablebuild/rune/blob/main/cmd/extension_python/lookup.go),
-  which finds tools on the workspace host.
 - [`handler.go`](https://github.com/unstablebuild/rune/blob/main/cmd/extension_python/handler.go),
   which implements Python-specific console commands.
 
@@ -227,12 +225,13 @@ to combine two behaviors:
 Python wires those pieces together in a small block:
 
 ```go
-init := langext.NewInitializer(ctx, fs, editor, langext.ProjectConfig{
+init := langext.NewInitializer(ctx, fs, editor, inst, langext.ProjectConfig{
     LanguageID: "python",
     Markers:    pyMarkers,
     FileMatch:  isPythonFile,
-    InitRoot: func(ctx context.Context, root langext.Root) error {
-        return initializeProjectRoot(ctx, fs, exec, notify, lsp, inst, cfg, dataDir, root)
+    Tools:      []string{"uv", "uvx", "ty", "ruff"},
+    InitRoot: func(ctx context.Context, root langext.Root, tools *langext.Tools) error {
+        return initializeProjectRoot(ctx, fs, exec, notify, lsp, tools, cfg, dataDir, root)
     },
 })
 if err := init.Start(); err != nil {
@@ -242,8 +241,9 @@ if err := init.Start(); err != nil {
 
 See the complete code, including eager initialization of a root project, in
 [`extension.go`](https://github.com/unstablebuild/rune/blob/main/cmd/extension_python/extension.go#L107-L128).
-Replace `python`, `pyMarkers`, and `isPythonFile` with your language's values,
-then make `InitRoot` call your own bring-up function.
+Replace `python`, `pyMarkers`, `isPythonFile`, and the tools with your
+language's values, then make `InitRoot` call your own bring-up function.
+[Step 3](#3-prepare-the-project-for-its-language-server) covers `Tools`.
 
 `langext` is an internal helper for integrations built in the Rune repository.
 An extension maintained in another Go module cannot import it as public SDK. It
@@ -288,14 +288,44 @@ environment synchronization fails and still starts its language server, because
 partial analysis is better than no analysis. Make the same decision explicitly
 for your ecosystem: fail only when the server cannot do useful work.
 
-When the package includes the language server, its executable should be resolved through
-[`FindInstalledExecutable`](https://github.com/unstablebuild/rune-go-sdk/blob/main/api/extensionapi/workspace.go),
-as Python does in
-[`lookup.go`](https://github.com/unstablebuild/rune/blob/main/cmd/extension_python/lookup.go#L28-L58).
-Support a user-configured path when appropriate, then decide whether a missing
-packaged binary should fall back to the workspace host's `PATH`. Treat “not
-installed” differently from permission, filesystem, and network errors; those
-usually deserve a visible warning rather than a silent fallback.
+When your package ships the language server or other tools, list them in
+`ProjectConfig.Tools` and grant the extension `PermissionPackages`. `InitRoot`
+receives a `*langext.Tools`; `tools.Find(ctx, "name")` returns the tool's
+absolute path under `bin/` in the package named after `LanguageID`. The path is
+on the workspace host, which may not be the machine the extension runs on.
+
+The first `Find` looks the package up. If it is not installed on the workspace
+host, Rune asks the user whether to install it, and `Find` waits for their
+answer. Nothing is looked up until `Find`, so call it only when the tool is
+about to be used: check user-configured paths first and skip setup the user
+declined, as Python does with its `command` override and unmanaged
+environments. Otherwise a user who never needs your package is still asked to
+install it. Work outside a project root, such as a console command, can get the
+same lookup from `Tools` on the initializer.
+
+`Find` tells the extension why a tool is missing so it can decide what the
+user needs to hear:
+
+- `pkgapi.ErrNotInstalled`: the package ended up not installed, because the
+  user declined or it is not published for the host's platform. Rune has
+  already told the user why, so do not notify again.
+- `langext.ErrNotShipped`: the package is installed but lacks the tool, a
+  packaging defect worth a warning.
+- Anything else: the lookup itself failed, say because the host is unreachable
+  or the user denied the extension package access, and the tool was not
+  provisioned under the install root either. Warn with the error.
+
+Then decide whether the tool should fall back to the workspace host's `PATH`,
+as Go, Zig and Python do, or whether bring-up cannot proceed without it, as
+Rust does with its toolchain installer.
+
+An extension outside the Rune repository can do the same lookup with `LibDir`
+on
+[`Packages`](https://github.com/unstablebuild/rune-go-sdk/blob/main/api/extensionapi/workspace.go).
+It reports `pkgapi.ErrNotInstalled` when the package ends up not installed,
+which Rune has already explained to the user. Other errors, such as permission,
+filesystem, and network failures, usually deserve a visible warning rather
+than a silent fallback.
 
 ## 4. Initialize the language server
 

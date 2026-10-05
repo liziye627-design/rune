@@ -2423,6 +2423,8 @@ func (h *workspaceManagerHandler) buildExtensions(
 	res = extension.MergeResourceMap(res, extension.SemanticResources(lspifc))
 	res = extension.MergeResourceMap(res, extension.DebugResources(dap))
 	res = extension.MergeResourceMap(res, extension.LLMResources(h.llmRouter))
+	res = extension.MergeResourceMap(res,
+		extension.PackagesResources(extensionPackages{pkgs: pkgs}))
 
 	// Register the top-level `models` REPL command. The llmshell
 	// reads the local llama.cpp registry directly off the router.
@@ -2482,7 +2484,7 @@ func (h *workspaceManagerHandler) hostPackageManager(
 	}
 	name := packageHostName(uri)
 	ui := hostPackageUI{Notifications: n, host: name, local: h.pkgmanager.pkg}
-	return newPkgManager(pkgrpc.NewClient(cc, ui), name, n,
+	return newPkgManager(pkgrpc.NewClient(cc, ui), name, h.pkgmanager.pkg, n,
 		storageapi.WithPartition(h.ideStorage, idepkg.StoragePartition),
 		h, cfg.scheduleNextTick, h, cfg.updatesAutoInstall())
 }

@@ -227,13 +227,6 @@ func waitForSocket(path string, timeout time.Duration) error {
 	return fmt.Errorf("socket %s did not appear within %s", path, timeout)
 }
 
-// calls returns how many times Prompt was invoked on this opener.
-func (p *e2ePromptOpener) calls() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return len(p.messages)
-}
-
 // publishingE2EBrowser is an e2eBrowser whose PublishEvent forwards to
 // the given publishEvent closure. Production's ex.Browser() (a
 // *text.Component) wires its PublishEvent method to the configured
