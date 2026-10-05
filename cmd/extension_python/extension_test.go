@@ -141,6 +141,47 @@ func pyTools(t *testing.T, inst *langexttest.Installer) *langext.Tools {
 	}).Tools()
 }
 
+// fakeInstallRoot is the data directory the IDE resolved on the
+// workspace host, which differs from the extension's own for a remote
+// workspace.
+type fakeInstallRoot struct {
+	dir     string
+	err     error
+	relpath string
+}
+
+func (r *fakeInstallRoot) FindInstalledResource(_ context.Context, relpath string) (string, error) {
+	r.relpath = relpath
+	if r.err != nil {
+		return "", r.err
+	}
+	return r.dir, nil
+}
+
+func TestHostDataDir(t *testing.T) {
+	tests := []struct {
+		name string
+		root *fakeInstallRoot
+		want string
+	}{
+		{
+			name: "resolves the install root on the workspace host",
+			root: &fakeInstallRoot{dir: "/home/rune/.rune"},
+			want: "/home/rune/.rune",
+		},
+		{
+			name: "unresolvable root disables the shims",
+			root: &fakeInstallRoot{err: os.ErrNotExist},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, hostDataDir(t.Context(), tc.root))
+			assert.Equal(t, ".", tc.root.relpath)
+		})
+	}
+}
+
 // notInstalled is a python package the user declined to install, so
 // every tool comes from PATH.
 var notInstalled = &langexttest.Installer{Err: fmt.Errorf("python: %w", pkgapi.ErrNotInstalled)}

@@ -74,11 +74,32 @@ func (e *pyExtension) ExtendWorkspace(
 		w.Editor(ctx),
 		w,
 		cfg,
-		w.DataDir(ctx),
+		hostDataDir(ctx, w),
 		w.Storage(ctx),
 		w.WindowManager(ctx),
 		w.RegisterREPLCommand,
 	)
+}
+
+// installRoot resolves paths under the data directory of the workspace
+// host, which the IDE resolves for extensions (extensionapi.Workspace).
+type installRoot interface {
+	FindInstalledResource(ctx context.Context, relpath string) (string, error)
+}
+
+// hostDataDir returns the data directory on the workspace host, where the
+// python package's tools, uv's managed interpreters and the shims live
+// (config.yaml gui.env). The extension's own data directory is a path on
+// the IDE host, which is not the workspace host for a remote workspace.
+// An empty result skips everything that touches that layout.
+func hostDataDir(ctx context.Context, root installRoot) string {
+	dir, err := root.FindInstalledResource(ctx, ".")
+	if err != nil {
+		slog.Warn("resolve data directory on the workspace host; python shims disabled",
+			"error", err)
+		return ""
+	}
+	return dir
 }
 
 // extendWorkspaceWith wires Python project discovery to per-root language
