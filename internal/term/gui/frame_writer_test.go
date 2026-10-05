@@ -45,65 +45,6 @@ import (
 	"unstable.build/rune/internal/workspace/workspacetest"
 )
 
-func TestFrameWriterDrawImage(t *testing.T) {
-	tests := []struct {
-		name    string
-		img     term.Image
-		want    bool
-		wantLen int
-		wantVis image.Rectangle
-	}{
-		{
-			name:    "inside the grid is kept unclipped",
-			img:     term.Image{Pos: term.Coordinates{X: 1, Y: 1}, Width: 3, Height: 2},
-			want:    true,
-			wantLen: 1,
-			wantVis: image.Rect(1, 1, 4, 3),
-		},
-		{
-			name:    "overflowing the grid is clipped to it",
-			img:     term.Image{Pos: term.Coordinates{X: 8, Y: 3}, Width: 5, Height: 5},
-			want:    true,
-			wantLen: 1,
-			wantVis: image.Rect(8, 3, 10, 5),
-		},
-		{
-			name:    "fully outside the grid is dropped",
-			img:     term.Image{Pos: term.Coordinates{X: 10, Y: 0}, Width: 2, Height: 2},
-			want:    true,
-			wantLen: 0,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			w := newFrameWriter(context.Background(), 10, 5)
-			assert.Equal(t, tt.want, w.DrawImage(tt.img))
-			require.Len(t, w.Images(), tt.wantLen)
-			if tt.wantLen > 0 {
-				assert.Equal(t, tt.wantVis, w.Images()[0].Visible())
-			}
-		})
-	}
-}
-
-func TestFrameWriterClearDropsPlacements(t *testing.T) {
-	w := newFrameWriter(context.Background(), 10, 5)
-	src := image.NewRGBA(image.Rect(0, 0, 2, 2))
-	require.True(t, w.DrawImage(term.Image{
-		Src: src, ID: 1, Width: 2, Height: 2,
-	}))
-	require.Len(t, w.Images(), 1)
-
-	released := w.Images()[:1]
-	require.NoError(t, w.Clear(term.Attributes{}))
-	assert.Empty(t, w.Images())
-	assert.Nil(t, released[0].Src, "Clear must release the pixel reference")
-
-	require.True(t, w.DrawImage(term.Image{ID: 2, Width: 1, Height: 1}))
-	require.Len(t, w.Images(), 1)
-	assert.Equal(t, term.ImageID(2), w.Images()[0].ID)
-}
-
 func TestFrameWriterComposite(t *testing.T) {
 	const width, height = 12, 4
 	grid := image.Rect(0, 0, width, height)
@@ -443,13 +384,19 @@ func TestFrameWriterComposite(t *testing.T) {
 			comptest.TestComponent(t, drawing(tt.draw), screen,
 				[]comptest.TestCase{{Expected: tt.want}})
 
-			written := cell.NewBufferWriter(context.Background(), width, height)
+			written := cellsOnly{cell.NewBufferWriter(context.Background(), width, height)}
 			tt.draw(written)
 			assert.Equal(t, written.RawCells(), screen.RawCells(),
 				"cells read back as written")
 		})
 	}
 }
+
+// cellsOnly drops placements, to read back the cells as they are
+// without any.
+type cellsOnly struct{ *cell.BufferWriter }
+
+func (cellsOnly) DrawImage(term.Image) bool { return false }
 
 func TestFrameWriterWindowsOverTerminalGraphics(t *testing.T) {
 	const width, height = 24, 8
@@ -606,113 +553,21 @@ func TestFrameWriterFloatingTerminalStacking(t *testing.T) {
 	})
 }
 
-// BenchmarkFrameWriter measures a frame's trip through the writer: a
-// handler drawing through the term.Writer API, then the renderer reading
-// the cells and placements back.
-func BenchmarkFrameWriter(b *testing.B) {
-	ex := term.NewCell('x', 1, term.Attributes{})
-	pic := picture("RGB", "GBR")
-	placeOver := func(w term.Writer, id term.ImageID, r image.Rectangle) {
-		w.DrawImage(term.Image{
-			Src: pic, ID: id, Pos: term.Coordinates{X: r.Min.X, Y: r.Min.Y},
-			Width: r.Dx(), Height: r.Dy(),
-		})
-	}
-	middle := func(r image.Rectangle) image.Rectangle {
-		return image.Rect(r.Dx()/3, r.Dy()/3, 2*r.Dx()/3, 2*r.Dy()/3)
-	}
-	scenes := []struct {
-		name string
-		draw func(w term.Writer, screen image.Rectangle, ids []term.ImageID)
-	}{
-		{
-			name: "text",
-			draw: func(w term.Writer, screen image.Rectangle, _ []term.ImageID) {
-				fill(w, screen, ex)
-			},
-		},
-		{
-			name: "picture",
-			draw: func(w term.Writer, screen image.Rectangle, ids []term.ImageID) {
-				fill(w, screen, ex)
-				placeOver(w, ids[0], screen)
-			},
-		},
-		{
-			name: "picture-under-window",
-			draw: func(w term.Writer, screen image.Rectangle, ids []term.ImageID) {
-				fill(w, screen, ex)
-				placeOver(w, ids[0], screen)
-				fill(w, middle(screen), ex)
-			},
-		},
-		{
-			name: "thumbnails-under-windows",
-			draw: func(w term.Writer, screen image.Rectangle, ids []term.ImageID) {
-				fill(w, screen, ex)
-				cw, ch := screen.Dx()/8, screen.Dy()/8
-				for i, id := range ids[:64] {
-					x, y := i%8*cw, i/8*ch
-					placeOver(w, id, image.Rect(x, y, x+cw-1, y+ch-1))
-				}
-				fill(w, middle(screen), ex)
-				fill(w, middle(screen).Add(image.Pt(screen.Dx()/6, screen.Dy()/6)), ex)
-			},
-		},
-		{
-			name: "pictures-between-windows",
-			draw: func(w term.Writer, screen image.Rectangle, ids []term.ImageID) {
-				fill(w, screen, ex)
-				for i, id := range ids[:8] {
-					placeOver(w, id, screen)
-					fill(w, middle(screen).Add(image.Pt(i-4, i-4)), ex)
-				}
-			},
-		},
-	}
-	sizes := []struct {
-		name          string
-		width, height int
-	}{
-		{name: "1080p", width: 213, height: 60},
-		{name: "2160p", width: 426, height: 120},
-	}
-	ids := make([]term.ImageID, 64)
-	for i := range ids {
-		ids[i] = term.NewImageID()
-	}
-	for _, size := range sizes {
-		for _, scene := range scenes {
-			b.Run(size.name+"/"+scene.name, func(b *testing.B) {
-				w := newFrameWriter(context.Background(), size.width, size.height)
-				screen := image.Rect(0, 0, size.width, size.height)
-				b.ReportAllocs()
-				for b.Loop() {
-					_ = w.Clear(term.Attributes{})
-					scene.draw(w, screen, ids)
-					_ = w.RawCells()
-					_ = w.Images()
-				}
-			})
-		}
-	}
-}
-
 // frameScreen is a comptest.StringerWriter over the writer the GUI draws
 // its handler into. Flush prints the frame the renderer composites, one
 // cell at a time: a cell where a placement paints an opaque texel shows
 // that texel's palette letter, any other cell its grapheme as
 // term.StringWriter prints it.
 type frameScreen struct {
-	*frameWriter
+	*cell.BufferWriter
 	fonts *font.Manager
 	out   strings.Builder
 }
 
 func newFrameScreen(t *testing.T, width, height int) *frameScreen {
 	return &frameScreen{
-		frameWriter: newFrameWriter(context.Background(), width, height),
-		fonts:       testFontManager(t),
+		BufferWriter: cell.NewBufferWriter(context.Background(), width, height),
+		fonts:        testFontManager(t),
 	}
 }
 
@@ -725,7 +580,7 @@ func (s *frameScreen) Flush() error {
 			screen[y][x] = grapheme(c)
 		}
 	}
-	bounds := cellRectToPixels(image.Rect(0, 0, s.width, s.height), s.fonts)
+	bounds := cellRectToPixels(image.Rect(0, 0, len(cells[0]), len(cells)), s.fonts)
 	for _, img := range s.Images() {
 		p, ok := resolvePlacement(img, s.fonts, bounds)
 		if !ok {

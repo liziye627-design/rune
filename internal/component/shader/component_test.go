@@ -18,6 +18,7 @@ package shader
 
 import (
 	"context"
+	"image"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"go.uber.org/goleak"
 	"unstable.build/rune/internal/cell"
+	"unstable.build/rune/internal/component/asciiart"
 )
 
 func TestShader(t *testing.T) {
@@ -91,6 +93,40 @@ AAAAAAAAAAAAAAAAAAAA
 		s.Draw(term.NewStringWriter(20, 10))
 
 		assert.Nil(t, s.buf)
+	})
+
+	t.Run("forwards image placements cut to the cells still showing them", func(t *testing.T) {
+		white := image.NewRGBA(image.Rect(0, 0, 2, 2))
+		for i := range white.Pix {
+			white.Pix[i] = 0xff
+		}
+		id := term.NewImageID()
+		root := drawFunc(func(w term.Writer) {
+			for y := range 4 {
+				for x := range 10 {
+					w.SetCell(term.Coordinates{X: x, Y: y}, term.NewCell('B', 1, term.Attributes{}))
+				}
+			}
+			assert.True(t, w.DrawImage(term.Image{
+				Src: white, ID: id, Pos: term.Coordinates{X: 2, Y: 1},
+				Width: 4, Height: 2, Fit: term.ImageFitFill,
+			}))
+			w.SetCell(term.Coordinates{X: 3, Y: 1}, term.NewCell('C', 1, term.Attributes{}))
+		})
+		s := &Component{
+			root:  root,
+			buf:   cell.NewBufferWriter(context.Background(), 10, 4),
+			total: 10,
+		}
+		s.shader = &testShader{}
+		s.Resize(10, 4)
+
+		w := asciiart.NewStringWriter(10, 4, asciiart.DefaultConfig())
+		comptest.TestComponent(t, s, w, []comptest.TestCase{{Expected: `
+AAAAAAAAAA
+AA@B@@AAAA
+AA@@@@AAAA
+AAAAAAAAAA`}})
 	})
 
 	t.Run("resizes underlying component", func(t *testing.T) {
@@ -184,6 +220,11 @@ type testShader struct {
 	frames []int
 	totals []int
 }
+
+type drawFunc func(term.Writer)
+
+func (f drawFunc) Draw(w term.Writer) { f(w) }
+func (drawFunc) Resize(int, int)      {}
 
 func (t *testShader) Shade(frame, total int, in [][]term.Cell) {
 	t.called = true

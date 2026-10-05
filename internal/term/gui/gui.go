@@ -33,6 +33,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"github.com/unstablebuild/rune-go-sdk/tui"
 	"github.com/unstablebuild/tcell/v3"
+	"unstable.build/rune/internal/cell"
 	"unstable.build/rune/internal/term/gui/drawrect"
 	"unstable.build/rune/internal/term/gui/font"
 )
@@ -70,7 +71,7 @@ type GUI struct {
 	fontManager       *font.Manager
 	updateChan        chan term.Event
 	handler           tui.Handler
-	writer            *frameWriter
+	writer            *cell.BufferWriter
 	mouse             *mouse
 	input             *input
 	drag              *dragPoller
@@ -750,7 +751,7 @@ func (g *GUI) resize(width, height int, deviceScale float64) {
 	g.mouse.resize(cellsWidth, cellsHeight)
 	g.cellPixelSize.Store(uint64(math.Round(g.fontManager.PixelX(1)))<<32 |
 		uint64(math.Round(g.fontManager.PixelY(1))))
-	g.writer = newFrameWriter(g.ctx, cellsWidth, cellsHeight)
+	g.writer = cell.NewBufferWriter(g.ctx, cellsWidth, cellsHeight)
 	if g.renderer != nil {
 		g.renderer.deallocate()
 	}

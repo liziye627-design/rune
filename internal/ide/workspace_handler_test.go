@@ -1759,6 +1759,72 @@ func awaitImageView(
 	}
 }
 
+func TestViewImageUnderCommandPromptShader(t *testing.T) {
+	const width, height = 42, 22
+	interrupts := make(chan struct{}, 1)
+	newTestPublishOverride = func(term.Event) bool {
+		select {
+		case interrupts <- struct{}{}:
+		default:
+		}
+		return true
+	}
+	t.Cleanup(func() { newTestPublishOverride = nil })
+
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "sample.png"), imageuritest.SamplePNG, 0o644))
+
+	m := newTestWorkspaceManagerHandlerWithDir(t,
+		defaultConfigWithWrap(false), dir, nopShutdownShaderConfig())
+	t.Cleanup(func() { _ = m.Close() })
+	uri, err := workspaceapi.ParseURI("file://" + dir)
+	require.NoError(t, err)
+	require.NoError(t, m.addOrCreateWorkspace(uri))
+	m.quiesce()
+
+	h := newSafeHandler(m)
+	w := asciiart.NewStringWriter(width, height, asciiart.DefaultConfig())
+	handlertest.RunHandlerSequenceWriter(t, w, h, width, height,
+		[]handlertest.SequenceTestCase{{
+			InputSequence: `<c-\\>view<space>sample.png<enter>`,
+			Expected:      viewImageLoadingPNG,
+		}})
+	awaitImageView(t, h, w, interrupts)
+
+	wh, ok := m.focusHandler().(*workspaceHandler)
+	require.True(t, ok)
+	wh.ex.commandPromptCfg.shader.enabled = true
+	handlertest.RunHandlerSequenceWriter(t, w, h, width, height,
+		[]handlertest.SequenceTestCase{{
+			InputSequence: `<c-\\>`,
+			Expected: `┌━━━━━━━━━━━━────────────────────────────┐
+│o sample.png                            │
+├────────────────────────────────────────┤
+│@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ │
+│@@@@@@@@@#b#@@@@##b##@@@##bW#@@@@@@@@@@ │
+│@@@@@@@bbbbbb#@acccccb@#cccc;c@@@@@@@@@ │
+│@@@@@@@#cbbbb##cccccc#@c;;;;;#@@@@@@@@@ │
+│@@@@@@@@@@@@@8cc#@@@@W;;#@@@@@@@@@@@@@@ │
+┌────────────────────────────────────────┐
+│ ▐                                      │
+│ !                                      │
+│ !!                                     │
+│ addBlaBla                              │
+│ cheatsheet                             │
+│ clipboardcopy                          │
+│ clipboardpaste                         │
+│ console                                │
+│ cursorhistory                          │
+│ debugger                               │
+├────────────────────────────────────────┤
+│1 1  2 2                                │
+└─────━━━────────────────────────────────┘`,
+		}})
+	require.NotNil(t, wh.ex.promptShader, "the prompt must draw through its shader")
+}
+
 func TestReadfileCrossWorkspaceIntegration(t *testing.T) {
 	tmp1 := t.TempDir()
 	tmp2 := t.TempDir()
