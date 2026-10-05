@@ -352,14 +352,13 @@ them, build your own image on top of it:
 ```dockerfile
 FROM unstablebuild/rune
 USER root
-RUN apk add --no-cache git make
+RUN apt-get update && apt-get install -y --no-install-recommends git make
 USER rune
 ```
 
 Build it with `docker build -t rune-node .` and run `rune-node` in place
-of `unstablebuild/rune` above. The image is Alpine, so take tools from
-`apk` or build them from source: prebuilt binaries linked against glibc
-do not run in it.
+of `unstablebuild/rune` above. The image is Debian, so `apt-get` and
+prebuilt binaries linked against glibc both work in it.
 
 ## Operating the node
 
