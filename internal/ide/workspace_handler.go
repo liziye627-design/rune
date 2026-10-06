@@ -177,6 +177,7 @@ type workspaceManagerHandler struct {
 	lastSession             idehistory.Session
 	reopenPending           bool
 	sessionReopenDisabled   bool
+	startupPrompts          []func()
 	packageConfigMergeHook  func(idepkg.ConfigMergeEvent) (idepkg.ConfigMergeResult, error)
 	watchedFilesChangeHook  func(int)
 	tutorialsInstalled      func(names []string) ([]string, error)
@@ -850,6 +851,7 @@ func (h *workspaceManagerHandler) init(
 	defer h.mu.Unlock()
 
 	if cwd == nil {
+		h.releaseStartupPrompts()
 		h.focusProxy.Target = h.focusHandler()
 		h.initTabs(cfg, workspacesBarHeight,
 			workspacesBarOffset, workspacesBarFrame)
@@ -1685,6 +1687,7 @@ func (h *workspaceManagerHandler) abortPendingBuild(
 	h.mu.Lock()
 	h.beginPendingWorkspaceTeardown(pending)
 	h.shaderRunner.stopLoading()
+	h.releaseStartupPrompts()
 	h.mu.Unlock()
 	if built != nil {
 		h.discardBuiltWorkspace(built)
@@ -2028,6 +2031,7 @@ func (h *workspaceManagerHandler) installPendingWorkspace(
 	// One-shot: only the first install of the session consumes the
 	// previous session's snapshot.
 	defer h.maybeReopenLastSession()
+	defer h.releaseStartupPrompts()
 
 	if pending.canceled.Load() {
 		h.beginPendingWorkspaceTeardown(pending)
@@ -3988,7 +3992,8 @@ func (h *workspaceManagerHandler) setReleaseManager(releaseManager release.Manag
 				_, _ = notifications.Notify(browserapi.LevelError,
 					"package manager: clean up: %v", err)
 			}
-			err := h.pkgmanager.pkg.ProcessInstalledSettings(ctx)
+			err := h.pkgmanager.pkg.ProcessInstalledSettings(idepkg.WithUI(ctx,
+				startupUI{Notifications: notifications, h: h}))
 			if err != nil {
 				_, _ = notifications.Notify(browserapi.LevelError,
 					"package manager: process installed settings: %v", err)
@@ -4012,6 +4017,31 @@ func (h *workspaceManagerHandler) setReleaseManager(releaseManager release.Manag
 		h, h, h.scheduleNextTick, parser,
 		editorMode, autoInstall, h.afterPackageConfigMerge, h.gitRemoteURL,
 		h.trust)
+}
+
+// startupUI is the idepkg.UI of the package manager while the editor
+// starts. A prompt shown before the workspace the editor launched with
+// is installed opens on the home screen, which that workspace then
+// covers, so it holds prompts until releaseStartupPrompts.
+type startupUI struct {
+	browserapi.Notifications
+	h *workspaceManagerHandler
+}
+
+func (u startupUI) PromptConfig(p idepkg.ConfigPrompt, answer func(approved bool)) {
+	u.h.startupPrompts = append(u.h.startupPrompts, func() {
+		u.h.pkgmanager.pkg.PromptConfig(p, answer)
+	})
+}
+
+// releaseStartupPrompts shows the prompts startupUI held on the screen in
+// focus, once; later calls show nothing.
+func (h *workspaceManagerHandler) releaseStartupPrompts() {
+	prompts := h.startupPrompts
+	h.startupPrompts = nil
+	for _, prompt := range prompts {
+		prompt()
+	}
 }
 
 func (h *workspaceManagerHandler) openURI(file workspaceapi.URI, focus bool) error {

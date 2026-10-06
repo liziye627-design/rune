@@ -17,12 +17,17 @@
 package ide
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -44,6 +49,7 @@ import (
 	"unstable.build/rune/auth"
 	"unstable.build/rune/internal/handler/handlertest"
 	"unstable.build/rune/internal/ide/console/pkgconsole"
+	"unstable.build/rune/internal/ide/hostenv"
 	"unstable.build/rune/internal/ide/idepkg"
 	"unstable.build/rune/internal/ide/idepkg/idepkgtest"
 	"unstable.build/rune/internal/localstorage"
@@ -644,6 +650,305 @@ func TestSetReleaseManager(t *testing.T) {
 	require.Equal(t, []string{"go"}, names)
 
 	require.NoError(t, m.Close())
+}
+
+func TestEditorRespellsWhatAnOlderReleaseExpandedWhenItStarts(t *testing.T) {
+	const expanded = "editor:\n  mode: modal\n" +
+		"gui:\n  env:\n    STARTPKG_HOME: <DATA>/lib/startpkg\n" +
+		"    PATH: /opt/mine/bin:<DATA>/lib/startpkg/bin:$PATH\n" +
+		"debugger:\n  startpkg:\n    command: <DATA>/lib/startpkg/dap --listen={addr}\n" +
+		"extensions:\n  startpkg:\n    path: <DATA>/lib/startpkg/ext\n" +
+		"tutorials:\n  startpkg-intro: <DATA>/lib/startpkg/intro.star\n"
+	const respelled = "editor:\n  mode: modal\n" +
+		"gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n" +
+		"    PATH: /opt/mine/bin:$RUNE_DATADIR/lib/startpkg/bin:$PATH\n" +
+		"debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/startpkg/dap --listen={addr}\n" +
+		"extensions:\n  startpkg:\n    path: $RUNE_DATADIR/lib/startpkg/ext\n" +
+		"tutorials:\n  startpkg-intro: $RUNE_DATADIR/lib/startpkg/intro.star\n"
+	for _, launch := range launches {
+		t.Run(launch.name, func(t *testing.T) {
+			h := newRestartHost(t)
+			h.writeConfig(t, expanded)
+
+			e := h.start(t, launch)
+			assert.Equal(t, respelled, h.readConfig(t))
+			merges := h.takeMerges()
+			require.Len(t, merges, 1)
+			assert.True(t, merges[0].TouchesPath("gui", "env"),
+				"the host re-applies gui.env after the merge")
+			assert.Contains(t, e.tutorialNames(), "startpkg-intro")
+			assert.Zero(t, countFloatingWindows(e.IDE, e.mu),
+				"the user already had everything the package provides: nothing to ask")
+			e.open(t)
+			e.requireExtensionStartedAt(t, h.expand("<DATA>/lib/startpkg/ext"))
+			e.stop(t)
+
+			e = h.start(t, launch)
+			assert.Equal(t, respelled, h.readConfig(t))
+			assert.Empty(t, h.takeMerges(), "the next start has nothing to respell")
+			assert.Zero(t, countFloatingWindows(e.IDE, e.mu))
+		})
+	}
+}
+
+func TestEditorAsksAtStartBeforeReplacingAnotherMachinesDataDir(t *testing.T) {
+	const foreign = "editor:\n  mode: modal\n" +
+		"gui:\n  env:\n    STARTPKG_HOME: /home/other/.rune/lib/startpkg\n" +
+		"    PATH: $RUNE_DATADIR/lib/startpkg/bin:$PATH\n" +
+		"debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/startpkg/dap --listen={addr}\n" +
+		"extensions:\n  startpkg:\n    path: $RUNE_DATADIR/lib/startpkg/ext\n" +
+		"tutorials:\n  startpkg-intro: $RUNE_DATADIR/lib/startpkg/intro.star\n"
+	const allowed = "editor:\n  mode: modal\n" +
+		"gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n" +
+		"    PATH: $RUNE_DATADIR/lib/startpkg/bin:$PATH\n" +
+		"debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/startpkg/dap --listen={addr}\n" +
+		"extensions:\n  startpkg:\n    path: $RUNE_DATADIR/lib/startpkg/ext\n" +
+		"tutorials:\n  startpkg-intro: $RUNE_DATADIR/lib/startpkg/intro.star\n"
+	for _, launch := range launches {
+		for _, answer := range []struct {
+			name  string
+			key   rune
+			after string
+		}{
+			{name: "allowed", key: 'a', after: allowed},
+			{name: "denied", key: 'd', after: foreign},
+		} {
+			t.Run(launch.name+"/"+answer.name, func(t *testing.T) {
+				h := newRestartHost(t)
+				h.writeConfig(t, foreign)
+
+				e := h.start(t, launch)
+				assert.Equal(t, foreign, h.readConfig(t), "nothing changes before the user answers")
+				assert.Empty(t, h.takeMerges())
+				require.Equal(t, 1, countFloatingWindows(e.IDE, e.mu), "the prompt is on the screen the user sees")
+				screen := e.screen()
+				assert.Contains(t, screen, "startpkg")
+				assert.Contains(t, screen, "STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg",
+					"the prompt shows what it writes")
+
+				e.press(answer.key)
+				assert.Equal(t, answer.after, h.readConfig(t))
+				assert.Zero(t, countFloatingWindows(e.IDE, e.mu))
+				merges := h.takeMerges()
+				if answer.after == foreign {
+					assert.Empty(t, merges)
+					return
+				}
+				require.Len(t, merges, 1)
+				assert.True(t, merges[0].TouchesPath("gui", "env"))
+				e.stop(t)
+
+				e = h.start(t, launch)
+				assert.Equal(t, allowed, h.readConfig(t))
+				assert.Zero(t, countFloatingWindows(e.IDE, e.mu), "an approved value is not asked about again")
+				assert.Empty(t, h.takeMerges())
+			})
+		}
+	}
+}
+
+type launch struct {
+	name string
+	// inWorkspace launches as `rune <dir>` does.
+	inWorkspace bool
+}
+
+var launches = []launch{
+	{name: "home screen"},
+	{name: "workspace", inWorkspace: true},
+}
+
+type restartHost struct {
+	dir, dataDir, configPath string
+	rm                       *idepkgtest.ReleaseManager
+
+	mu     sync.Mutex
+	merges []idepkg.ConfigMergeEvent
+}
+
+const startpkgConfig = "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n" +
+	"    PATH: $RUNE_DATADIR/lib/$RUNE_PKG_ID/bin:$PATH\n" +
+	"debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/$RUNE_PKG_ID/dap --listen={addr}\n" +
+	"extensions:\n  startpkg:\n    path: $RUNE_DATADIR/lib/$RUNE_PKG_ID/ext\n" +
+	"tutorials:\n  startpkg-intro: $RUNE_DATADIR/lib/$RUNE_PKG_ID/intro.star\n"
+
+func newRestartHost(t *testing.T) *restartHost {
+	t.Helper()
+	dir := t.TempDir()
+	h := &restartHost{
+		dir:        dir,
+		dataDir:    t.TempDir(),
+		configPath: filepath.Join(dir, "rune.yaml"),
+	}
+	h.rm = idepkgtest.NewReleaseManager(
+		idepkgtest.MakePackages(release.Package{Name: "startpkg", Latest: "1"}),
+		idepkgtest.MakeBundles([]release.Bundle{{Package: "startpkg", Version: "1"}}))
+	h.rm.SetMissProgressComplete(true)
+	h.rm.SetTarball("startpkg", filesTarball(t, map[string]string{
+		"config.yaml":    startpkgConfig,
+		"intro.star":     minimalStarTutorial,
+		"lib/readme.txt": "startpkg\n",
+	}))
+	require.NoError(t, os.WriteFile(h.configPath, []byte("editor:\n  mode: modal\n"), 0o644))
+
+	// Without e.mu: the merge hook takes the handler lock.
+	e := h.start(t, launch{})
+	require.NoError(t, e.PackageManager().InstallPackageVersion(context.Background(),
+		"startpkg", "1", repl.NopProgressWriter()))
+	e.drain()
+	e.stop(t)
+	h.takeMerges()
+	return h
+}
+
+type startedEditor struct {
+	*IDE
+	mu      *sync.Mutex
+	drain   func() uint64
+	runner  *recordingRunner
+	dir     string
+	dataDir string
+	stop    func(t *testing.T)
+}
+
+func (h *restartHost) start(t *testing.T, l launch) *startedEditor {
+	t.Helper()
+	mu := new(sync.Mutex)
+	sched, drain := newTestScheduler(t, mu)
+	storage := localstorage.New(context.Background(), h.dataDir, docbson.Marshaler())
+	runner := &recordingRunner{}
+	workspace := ""
+	if l.inWorkspace {
+		workspace = h.dir
+	}
+	i, err := New(workspace, h.configPath, h.dataDir, idepkgtest.TrustStore(), storage,
+		WithReleaseManager(h.rm),
+		WithPublishEvent(nopPublishEvent),
+		WithExtensionsRunner(recordingExtensionsRunner{runner: runner}),
+		WithLocker(mu),
+		WithScheduleNextTick(sched),
+		WithPackageConfigMergeHook(h.afterMerge),
+		// Its reopen prompt would be a second floating window.
+		WithoutSessionReopen(),
+	)
+	require.NoError(t, err)
+	stopped := false
+	stop := func(t *testing.T) {
+		if stopped {
+			return
+		}
+		stopped = true
+		drain()
+		require.NoError(t, i.Close())
+		require.NoError(t, storage.Close())
+	}
+	t.Cleanup(func() { stop(t) })
+	_ = i.Ready()
+	drain()
+	i.WaitWorkspaces()
+	drain()
+	mu.Lock()
+	i.root.Resize(120, 40)
+	mu.Unlock()
+	drain()
+	return &startedEditor{IDE: i, mu: mu, drain: drain, runner: runner,
+		dir: h.dir, dataDir: h.dataDir, stop: stop}
+}
+
+func (e *startedEditor) open(t *testing.T) {
+	t.Helper()
+	uri, err := workspaceapi.CurrentUserHostURI(e.dir)
+	require.NoError(t, err)
+	e.mu.Lock()
+	require.NoError(t, e.workspaceHandler.addWorkspace(uri, false, false, -1))
+	e.mu.Unlock()
+	e.drain()
+	e.WaitWorkspaces()
+	e.drain()
+}
+
+func (h *restartHost) afterMerge(event idepkg.ConfigMergeEvent) (idepkg.ConfigMergeResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.merges = append(h.merges, event)
+	return idepkg.ConfigMergeResult{LivePaths: [][]string{{"gui", "env"}}}, nil
+}
+
+func (h *restartHost) takeMerges() []idepkg.ConfigMergeEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	merges := h.merges
+	h.merges = nil
+	return merges
+}
+
+func (h *restartHost) expand(s string) string {
+	return strings.ReplaceAll(s, "<DATA>", h.dataDir)
+}
+
+func (h *restartHost) writeConfig(t *testing.T, config string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(h.configPath, []byte(h.expand(config)), 0o644))
+}
+
+func (h *restartHost) readConfig(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(h.configPath)
+	require.NoError(t, err)
+	return string(b)
+}
+
+func (e *startedEditor) tutorialNames() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.TutorialNames()
+}
+
+func (e *startedEditor) screen() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	w := term.NewStringWriter(120, 40)
+	e.root.Draw(w)
+	_ = w.Flush()
+	return w.String()
+}
+
+func (e *startedEditor) press(key rune) {
+	e.mu.Lock()
+	e.root.Handle(term.Event{Type: term.EventKey, Ch: key})
+	e.mu.Unlock()
+	e.drain()
+}
+
+func (e *startedEditor) requireExtensionStartedAt(t *testing.T, entrypoint string) {
+	t.Helper()
+	var calls []runCall
+	require.Eventually(t, func() bool {
+		calls = slices.DeleteFunc(e.runner.runCalls(), func(c runCall) bool {
+			return c.id != "startpkg"
+		})
+		return len(calls) > 0
+	}, 10*time.Second, 20*time.Millisecond, "startpkg's extension never started")
+	for _, c := range calls {
+		assert.Equal(t, entrypoint, hostenv.ExpandDataDir(c.path, e.dataDir))
+	}
+}
+
+func filesTarball(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	for name, content := range files {
+		require.NoError(t, tw.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o644, Size: int64(len(content)),
+		}))
+		_, err := tw.Write([]byte(content))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gzw.Close())
+	return buf.Bytes()
 }
 
 func pkgVersionInUse(

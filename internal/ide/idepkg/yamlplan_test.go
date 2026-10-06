@@ -539,6 +539,12 @@ func TestMergePathValue(t *testing.T) {
 			want:     "$RUNE_DATADIR/bin:/data/bin:$PATH",
 		},
 		{
+			name:     "chunk the user spelled another way is present",
+			userPath: "/user/bin:${RUNE_DATADIR}/bin:$PATH",
+			pkgPath:  "$RUNE_DATADIR/bin:$PATH",
+			want:     "/user/bin:${RUNE_DATADIR}/bin:$PATH",
+		},
+		{
 			name:        "chunk under another data directory is added",
 			userPath:    "/other/bin:$PATH",
 			pkgPath:     "$RUNE_DATADIR/bin:$PATH",

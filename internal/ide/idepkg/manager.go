@@ -1555,8 +1555,9 @@ type valueChange int
 const (
 	// valueSame keeps the user value.
 	valueSame valueChange = iota
-	// valueRespelled replaces the user value without asking: it names the
-	// same thing as the overlay once $RUNE_DATADIR is expanded locally.
+	// valueRespelled replaces the user value without asking: it is the
+	// overlay as a release that expanded $RUNE_DATADIR at install time
+	// wrote it.
 	valueRespelled
 	// valueConflict replaces the user value only with the user's approval.
 	valueConflict
@@ -1581,13 +1582,24 @@ func scalarChange(
 	if overlayStr == userStr {
 		return nil, valueSame
 	}
-	if sameAfterDataDir(userStr, overlayStr, dataDir) {
+	if expandedAtInstall(userStr, overlayStr, dataDir) {
 		return overlayVal, valueRespelled
+	}
+	if sameAfterDataDir(userStr, overlayStr, dataDir) {
+		return nil, valueSame
 	}
 	if isGUIEnvLeaf(keyPath) || versionDependent {
 		return overlayVal, valueConflict
 	}
 	return nil, valueSame
+}
+
+// expandedAtInstall reports whether userStr is overlayStr with $RUNE_DATADIR
+// expanded with dataDir, as older releases merged it. Any other spelling of
+// the same value, such as ${RUNE_DATADIR}, is the user's to keep.
+func expandedAtInstall(userStr, overlayStr, dataDir string) bool {
+	return dataDir != "" && userStr != overlayStr &&
+		userStr == hostenv.ExpandDataDir(overlayStr, dataDir)
 }
 
 // sameAfterDataDir reports whether the user and overlay spellings name the
@@ -1597,8 +1609,8 @@ func sameAfterDataDir(userStr, overlayStr, dataDir string) bool {
 		hostenv.ExpandDataDir(userStr, dataDir) == hostenv.ExpandDataDir(overlayStr, dataDir)
 }
 
-// listRespelled reports whether two lists of scalars differ, but only in how
-// their elements spell the data directory.
+// listRespelled reports whether two lists of scalars differ only in elements
+// that a release expanded $RUNE_DATADIR in at install time.
 func listRespelled(userVal, overlayVal any, dataDir string) bool {
 	userList, ok := userVal.([]any)
 	if !ok {
@@ -1617,7 +1629,7 @@ func listRespelled(userVal, overlayVal any, dataDir string) bool {
 		if userStr == overlayStr {
 			continue
 		}
-		if !sameAfterDataDir(userStr, overlayStr, dataDir) {
+		if !expandedAtInstall(userStr, overlayStr, dataDir) {
 			return false
 		}
 		differ = true
@@ -1648,10 +1660,10 @@ func isScalar(v any) bool {
 }
 
 // mergePathValue merges the package's PATH chunks into the user's. A user
-// chunk that names the same directory as a package chunk once $RUNE_DATADIR
-// is expanded with dataDir is rewritten in place to the package spelling
-// (respelled); package chunks the user lacks are prepended in package order
-// (added).
+// chunk that is a package chunk with $RUNE_DATADIR expanded with dataDir is
+// rewritten in place to the package spelling (respelled); a user chunk naming
+// the same directory in another spelling counts as present; package chunks
+// the user lacks are prepended in package order (added).
 func mergePathValue(userPath, pkgPath, dataDir string) (merged string, respelled, added bool) {
 	if pkgPath == "" {
 		return userPath, false, false
@@ -1667,12 +1679,14 @@ func mergePathValue(userPath, pkgPath, dataDir string) (merged string, respelled
 			continue
 		}
 		present[chunk] = struct{}{}
-		if i := respelledChunk(userChunks, chunk, dataDir); i >= 0 {
+		i, same := userChunkFor(userChunks, chunk, dataDir)
+		switch {
+		case i >= 0:
 			userChunks[i] = chunk
 			respelled = true
-			continue
+		case !same:
+			missing = append(missing, chunk)
 		}
-		missing = append(missing, chunk)
 	}
 	userPath = strings.Join(userChunks, ":")
 	if len(missing) == 0 {
@@ -1684,16 +1698,21 @@ func mergePathValue(userPath, pkgPath, dataDir string) (merged string, respelled
 	return strings.Join(missing, ":") + ":" + userPath, respelled, true
 }
 
-func respelledChunk(userChunks []string, pkgChunk, dataDir string) int {
+// userChunkFor returns the index of the user chunk to respell to pkgChunk, or
+// -1 when there is none, and whether some user chunk names pkgChunk's
+// directory already.
+func userChunkFor(userChunks []string, pkgChunk, dataDir string) (int, bool) {
 	if !strings.Contains(pkgChunk, hostenv.DataDirVar) {
-		return -1
+		return -1, false
 	}
+	same := false
 	for i, chunk := range userChunks {
-		if chunk != pkgChunk && sameAfterDataDir(chunk, pkgChunk, dataDir) {
-			return i
+		if expandedAtInstall(chunk, pkgChunk, dataDir) {
+			return i, true
 		}
+		same = same || sameAfterDataDir(chunk, pkgChunk, dataDir)
 	}
-	return -1
+	return -1, same
 }
 
 func versionDependentKeys(overlay map[string]any) map[string]any {

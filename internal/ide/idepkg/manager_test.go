@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -2839,6 +2840,561 @@ func TestProcessInstalledSettingsSkipsIncomplete(t *testing.T) {
 }
 
 // --- Atomic operation tests ---
+
+func TestProcessInstalledSettingsRespellsWhatAnOlderReleaseExpanded(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		pkg    startupPackage
+		before string
+		after  string
+	}{
+		{
+			name: "gui.env value",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n",
+			},
+			before: "gui:\n  env:\n    STARTPKG_HOME: <DATA>/lib/startpkg\n",
+			after:  "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n",
+		},
+		{
+			name: "gui.env value pinned to the version in use",
+			pkg: startupPackage{
+				config:   "gui:\n  env:\n    GOROOT: $RUNE_DATADIR/pkg/$RUNE_PKG_ID/$RUNE_PKG_VERSION/go\n",
+				versions: []string{"1", "2"},
+			},
+			before: "gui:\n  env:\n    GOROOT: <DATA>/pkg/startpkg/2/go\n",
+			after:  "gui:\n  env:\n    GOROOT: $RUNE_DATADIR/pkg/startpkg/2/go\n",
+		},
+		{
+			name: "braced spelling is kept as the package writes it",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    STARTPKG_HOME: ${RUNE_DATADIR}/lib/$RUNE_PKG_ID\n",
+			},
+			before: "gui:\n  env:\n    STARTPKG_HOME: <DATA>/lib/startpkg\n",
+			after:  "gui:\n  env:\n    STARTPKG_HOME: ${RUNE_DATADIR}/lib/startpkg\n",
+		},
+		{
+			name: "data directory inside a longer value",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    STARTPKG_FLAGS: --root=$RUNE_DATADIR/lib/$RUNE_PKG_ID --fast\n",
+			},
+			before: "gui:\n  env:\n    STARTPKG_FLAGS: --root=<DATA>/lib/startpkg --fast\n",
+			after:  "gui:\n  env:\n    STARTPKG_FLAGS: --root=$RUNE_DATADIR/lib/startpkg --fast\n",
+		},
+		{
+			name: "gui.env PATH entry among the user's own",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    PATH: $RUNE_DATADIR/lib/$RUNE_PKG_ID/bin:$PATH\n",
+			},
+			before: "gui:\n  env:\n    PATH: /opt/mine/bin:<DATA>/lib/startpkg/bin:$PATH:/opt/last/bin\n",
+			after:  "gui:\n  env:\n    PATH: /opt/mine/bin:$RUNE_DATADIR/lib/startpkg/bin:$PATH:/opt/last/bin\n",
+		},
+		{
+			name: "setting outside gui.env",
+			pkg: startupPackage{
+				config: "debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/$RUNE_PKG_ID/dap --listen={addr}\n",
+			},
+			before: "debugger:\n  startpkg:\n    command: <DATA>/lib/startpkg/dap --listen={addr}\n",
+			after:  "debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/startpkg/dap --listen={addr}\n",
+		},
+		{
+			name: "list element",
+			pkg: startupPackage{
+				config: "extensions:\n  startpkg:\n    config:\n      roots:\n" +
+					"        - $RUNE_DATADIR/lib/$RUNE_PKG_ID/std\n        - /usr/share/startpkg\n",
+			},
+			before: "extensions:\n  startpkg:\n    config:\n      roots:\n" +
+				"        - <DATA>/lib/startpkg/std\n        - /usr/share/startpkg\n",
+			after: "extensions:\n  startpkg:\n    config:\n      roots:\n" +
+				"        - $RUNE_DATADIR/lib/startpkg/std\n        - /usr/share/startpkg\n",
+		},
+		{
+			name: "extension entrypoint",
+			pkg: startupPackage{
+				config: "extensions:\n  startpkg:\n    path: $RUNE_DATADIR/lib/$RUNE_PKG_ID/ext\n",
+			},
+			before: "extensions:\n  startpkg:\n    path: <DATA>/lib/startpkg/ext\n",
+			after:  "extensions:\n  startpkg:\n    path: $RUNE_DATADIR/lib/startpkg/ext\n",
+		},
+		{
+			name: "tutorial",
+			pkg: startupPackage{
+				config: "tutorials:\n  startpkg-intro: $RUNE_DATADIR/lib/$RUNE_PKG_ID/intro.star\n",
+			},
+			before: "tutorials:\n  startpkg-intro: <DATA>/lib/startpkg/intro.star\n",
+			after:  "tutorials:\n  startpkg-intro: $RUNE_DATADIR/lib/startpkg/intro.star\n",
+		},
+		{
+			name: "value a starlark package config builds from RUNE_DATADIR",
+			pkg: startupPackage{
+				file: "config.star",
+				config: "config[\"gui\"] = {\"env\": {\"STARTPKG_HOME\": " +
+					"RUNE_DATADIR + \"/lib/\" + RUNE_PKG_ID}}\n",
+			},
+			before: "gui:\n  env:\n    STARTPKG_HOME: <DATA>/lib/startpkg\n",
+			after:  "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n",
+		},
+		{
+			name: "user's comments, order and other keys are kept",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n",
+			},
+			before: "# mine\neditor:\n  mode: modal # modal for me\ngui:\n  env:\n" +
+				"    # startpkg wrote this\n    STARTPKG_HOME: <DATA>/lib/startpkg # keep\n" +
+				"    MINE: /opt/mine\nworkspace:\n  home: /work\n",
+			after: "# mine\neditor:\n  mode: modal # modal for me\ngui:\n  env:\n" +
+				"    # startpkg wrote this\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg # keep\n" +
+				"    MINE: /opt/mine\nworkspace:\n  home: /work\n",
+		},
+		{
+			name: "every value of the package at once",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n" +
+					"    PATH: $RUNE_DATADIR/lib/$RUNE_PKG_ID/bin:$PATH\n" +
+					"debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/$RUNE_PKG_ID/dap --listen={addr}\n" +
+					"tutorials:\n  startpkg-intro: $RUNE_DATADIR/lib/$RUNE_PKG_ID/intro.star\n",
+			},
+			before: "gui:\n  env:\n    STARTPKG_HOME: <DATA>/lib/startpkg\n" +
+				"    PATH: <DATA>/lib/startpkg/bin:$PATH\n" +
+				"debugger:\n  startpkg:\n    command: <DATA>/lib/startpkg/dap --listen={addr}\n" +
+				"tutorials:\n  startpkg-intro: <DATA>/lib/startpkg/intro.star\n",
+			after: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n" +
+				"    PATH: $RUNE_DATADIR/lib/startpkg/bin:$PATH\n" +
+				"debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/startpkg/dap --listen={addr}\n" +
+				"tutorials:\n  startpkg-intro: $RUNE_DATADIR/lib/startpkg/intro.star\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newStartupHost(t, "config.yaml", tc.pkg)
+			h.writeConfig(t, tc.before)
+
+			h.launch(t)
+			assert.Equal(t, h.expand(tc.after), h.readConfig(t))
+			assert.Zero(t, h.promptCount(), "respelling changes nothing on this host to ask about")
+			assert.Len(t, h.merged(), 1, "the host re-applies what the merge touched")
+			assert.Len(t, h.notices(), 1)
+
+			h.launch(t)
+			assert.Equal(t, h.expand(tc.after), h.readConfig(t),
+				"the next launch leaves the respelled config as it is")
+			assert.Zero(t, h.promptCount())
+			assert.Empty(t, h.merged())
+			assert.Empty(t, h.notices())
+		})
+	}
+}
+
+func TestProcessInstalledSettingsKeepsWhatIsNotThisDataDir(t *testing.T) {
+	t.Parallel()
+	debuggerPkg := startupPackage{
+		config: "debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/$RUNE_PKG_ID/dap --listen={addr}\n",
+	}
+	for _, tc := range []struct {
+		name   string
+		pkg    startupPackage
+		config string
+	}{
+		{
+			name: "value already spelled with RUNE_DATADIR",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n",
+			},
+			config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n",
+		},
+		{
+			name: "braced value already spelled with RUNE_DATADIR",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n",
+			},
+			config: "gui:\n  env:\n    STARTPKG_HOME: ${RUNE_DATADIR}/lib/startpkg\n",
+		},
+		{
+			name: "braced PATH entry already spelled with RUNE_DATADIR",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    PATH: $RUNE_DATADIR/lib/$RUNE_PKG_ID/bin:$PATH\n",
+			},
+			config: "gui:\n  env:\n    PATH: /opt/mine/bin:${RUNE_DATADIR}/lib/startpkg/bin:$PATH\n",
+		},
+		{
+			name: "braced list element already spelled with RUNE_DATADIR",
+			pkg: startupPackage{
+				config: "extensions:\n  startpkg:\n    config:\n      roots:\n" +
+					"        - $RUNE_DATADIR/lib/$RUNE_PKG_ID/std\n",
+			},
+			config: "extensions:\n  startpkg:\n    config:\n      roots:\n" +
+				"        - ${RUNE_DATADIR}/lib/startpkg/std\n",
+		},
+		{
+			name:   "user's own value outside gui.env",
+			pkg:    debuggerPkg,
+			config: "debugger:\n  startpkg:\n    command: /opt/custom/dap --listen={addr}\n",
+		},
+		{
+			name:   "sibling of the data directory outside gui.env",
+			pkg:    debuggerPkg,
+			config: "debugger:\n  startpkg:\n    command: <DATA>-old/lib/startpkg/dap --listen={addr}\n",
+		},
+		{
+			name:   "another machine's data directory outside gui.env",
+			pkg:    debuggerPkg,
+			config: "debugger:\n  startpkg:\n    command: /home/other/.rune/lib/startpkg/dap --listen={addr}\n",
+		},
+		{
+			name: "PATH that already has the package's entry",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    PATH: $RUNE_DATADIR/lib/$RUNE_PKG_ID/bin:$PATH\n",
+			},
+			config: "gui:\n  env:\n    PATH: $RUNE_DATADIR/lib/startpkg/bin:<DATA>/lib/startpkg/bin:$PATH\n",
+		},
+		{
+			name: "value no installed package provides",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n",
+			},
+			config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n" +
+				"    GONE_HOME: <DATA>/lib/gone\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newStartupHost(t, "config.yaml", tc.pkg)
+			h.writeConfig(t, tc.config)
+
+			h.launch(t)
+			assert.Equal(t, h.expand(tc.config), h.readConfig(t))
+			assert.Zero(t, h.promptCount())
+			assert.Empty(t, h.merged())
+			assert.Empty(t, h.notices())
+			_, err := os.Stat(h.configPath + ".backup")
+			assert.ErrorIs(t, err, os.ErrNotExist, "an untouched config is not backed up")
+		})
+	}
+}
+
+func TestProcessInstalledSettingsAsksBeforeReplacingAnotherDataDir(t *testing.T) {
+	t.Parallel()
+	homePkg := startupPackage{
+		config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n",
+	}
+	for _, tc := range []struct {
+		name    string
+		pkg     startupPackage
+		before  string
+		allowed string
+		asked   string
+	}{
+		{
+			name:    "gui.env value under another machine's data directory",
+			pkg:     homePkg,
+			before:  "gui:\n  env:\n    STARTPKG_HOME: /home/other/.rune/lib/startpkg\n",
+			allowed: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n",
+			asked:   "$RUNE_DATADIR/lib/startpkg",
+		},
+		{
+			name:    "gui.env value under a sibling of the data directory",
+			pkg:     homePkg,
+			before:  "gui:\n  env:\n    STARTPKG_HOME: <DATA>-old/lib/startpkg\n",
+			allowed: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/startpkg\n",
+			asked:   "$RUNE_DATADIR/lib/startpkg",
+		},
+		{
+			name: "gui.env PATH entry under another machine's data directory",
+			pkg: startupPackage{
+				config: "gui:\n  env:\n    PATH: $RUNE_DATADIR/lib/$RUNE_PKG_ID/bin:$PATH\n",
+			},
+			before: "gui:\n  env:\n    PATH: /home/other/.rune/lib/startpkg/bin:$PATH\n",
+			allowed: "gui:\n  env:\n    PATH: $RUNE_DATADIR/lib/startpkg/bin:" +
+				"/home/other/.rune/lib/startpkg/bin:$PATH\n",
+			asked: "$RUNE_DATADIR/lib/startpkg/bin",
+		},
+		{
+			name: "value pinned to a version no longer in use",
+			pkg: startupPackage{
+				config:   "gui:\n  env:\n    GOROOT: $RUNE_DATADIR/pkg/$RUNE_PKG_ID/$RUNE_PKG_VERSION/go\n",
+				versions: []string{"1", "2"},
+			},
+			before:  "gui:\n  env:\n    GOROOT: <DATA>/pkg/startpkg/1/go\n",
+			allowed: "gui:\n  env:\n    GOROOT: $RUNE_DATADIR/pkg/startpkg/2/go\n",
+			asked:   "$RUNE_DATADIR/pkg/startpkg/2/go",
+		},
+	} {
+		for _, allow := range []bool{true, false} {
+			name := tc.name + "/denied"
+			if allow {
+				name = tc.name + "/allowed"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				h := newStartupHost(t, "config.yaml", tc.pkg)
+				h.writeConfig(t, tc.before)
+				h.answer(allow)
+
+				h.launch(t)
+				prompts := h.prompts()
+				require.Len(t, prompts, 1)
+				assert.Contains(t, prompts[0], tc.asked, "the prompt shows what is written")
+				if !allow {
+					assert.Equal(t, h.expand(tc.before), h.readConfig(t))
+					assert.Empty(t, h.merged())
+					return
+				}
+				assert.Equal(t, h.expand(tc.allowed), h.readConfig(t))
+				assert.Len(t, h.merged(), 1)
+
+				h.launch(t)
+				assert.Equal(t, h.expand(tc.allowed), h.readConfig(t))
+				assert.Zero(t, h.promptCount(), "an approved value is not asked about again")
+			})
+		}
+	}
+}
+
+func TestProcessInstalledSettingsRespellsTheManagedSectionOfAStarlarkConfig(t *testing.T) {
+	t.Parallel()
+	h := newStartupHost(t, "config.star", startupPackage{
+		config: "gui:\n  env:\n    STARTPKG_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n" +
+			"debugger:\n  startpkg:\n    command: $RUNE_DATADIR/lib/$RUNE_PKG_ID/dap --listen={addr}\n",
+	})
+	const userCode = "config = {\"editor\": {\"mode\": \"modal\"}}\n"
+	require.NoError(t, os.WriteFile(h.configPath, []byte(userCode), 0o644))
+	require.NoError(t, starlarkconfig.WriteManagedConfigFileAtomic(h.configPath, map[string]any{
+		"gui": map[string]any{"env": map[string]any{
+			"STARTPKG_HOME": h.expand("<DATA>/lib/startpkg"),
+		}},
+		"debugger": map[string]any{"startpkg": map[string]any{
+			"command": h.expand("<DATA>/lib/startpkg/dap --listen={addr}"),
+		}},
+	}))
+
+	h.launch(t)
+	cfg := readUserConfigMap(t, h.configPath)
+	assert.Equal(t, map[string]any{"STARTPKG_HOME": "$RUNE_DATADIR/lib/startpkg"},
+		cfg["gui"].(map[string]any)["env"])
+	assert.Equal(t, map[string]any{"startpkg": map[string]any{
+		"command": "$RUNE_DATADIR/lib/startpkg/dap --listen={addr}",
+	}}, cfg["debugger"])
+	assert.Equal(t, map[string]any{"mode": "modal"}, cfg["editor"])
+	raw := h.readConfig(t)
+	assert.True(t, strings.HasPrefix(raw, userCode), "the user's own code is kept:\n%s", raw)
+	assert.Equal(t, 1, strings.Count(raw, starlarkconfig.ManagedBegin))
+	assert.NotContains(t, raw, h.dataDir)
+	assert.Zero(t, h.promptCount())
+
+	h.launch(t)
+	assert.Equal(t, raw, h.readConfig(t), "the next launch leaves the respelled config as it is")
+	assert.Empty(t, h.merged())
+}
+
+func TestProcessInstalledSettingsRespellsEveryPackageInUse(t *testing.T) {
+	t.Parallel()
+	h := newStartupHost(t, "config.yaml",
+		startupPackage{
+			id:     "alphapkg",
+			config: "gui:\n  env:\n    ALPHA_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n",
+		},
+		startupPackage{
+			id:     "betapkg",
+			config: "gui:\n  env:\n    BETA_HOME: $RUNE_DATADIR/lib/$RUNE_PKG_ID\n",
+		},
+	)
+	h.writeConfig(t, "gui:\n  env:\n    ALPHA_HOME: <DATA>/lib/alphapkg\n"+
+		"    BETA_HOME: <DATA>/lib/betapkg\n")
+
+	h.launch(t)
+	assert.Equal(t, "gui:\n  env:\n    ALPHA_HOME: $RUNE_DATADIR/lib/alphapkg\n"+
+		"    BETA_HOME: $RUNE_DATADIR/lib/betapkg\n", h.readConfig(t))
+	assert.Zero(t, h.promptCount())
+	assert.Len(t, h.merged(), 2, "each package's merge is applied on its own")
+}
+
+type startupPackage struct {
+	// id defaults to "startpkg".
+	id string
+	// file defaults to "config.yaml".
+	file   string
+	config string
+	// versions are installed in order, so the last one is in use. It
+	// defaults to ["1"].
+	versions []string
+}
+
+type startupHost struct {
+	m          *Manager
+	n          *idepkgtest.Notifications
+	dataDir    string
+	configPath string
+
+	mu     sync.Mutex
+	allow  bool
+	asked  []string
+	merges []ConfigMergeEvent
+}
+
+func newStartupHost(t *testing.T, configName string, pkgs ...startupPackage) *startupHost {
+	t.Helper()
+	dataDir, err := os.MkdirTemp("", "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dataDir) })
+	h := &startupHost{
+		n:          idepkgtest.NewNotifications(t),
+		dataDir:    dataDir,
+		configPath: filepath.Join(dataDir, configName),
+		allow:      true,
+	}
+
+	var packages []release.Package
+	var bundles [][]release.Bundle
+	for i := range pkgs {
+		p := &pkgs[i]
+		if p.id == "" {
+			p.id = "startpkg"
+		}
+		if p.file == "" {
+			p.file = "config.yaml"
+		}
+		if len(p.versions) == 0 {
+			p.versions = []string{"1"}
+		}
+		packages = append(packages, release.Package{
+			Name: p.id, Latest: release.Version(p.versions[len(p.versions)-1]),
+		})
+		var versions []release.Bundle
+		for _, v := range p.versions {
+			versions = append(versions, release.Bundle{Package: p.id, Version: release.Version(v)})
+		}
+		bundles = append(bundles, versions)
+	}
+	rm := idepkgtest.NewReleaseManager(
+		idepkgtest.MakePackages(packages...), idepkgtest.MakeBundles(bundles...))
+	for _, p := range pkgs {
+		rm.SetTarball(p.id, startupPackageTarball(t, p.file, p.config))
+	}
+
+	wm := &mockWindowManager{floatingFn: h.prompt}
+	h.m = NewManager(h.n, rm, storagestub.NewInMemoryService(), idepkgtest.TrustStore(),
+		newLocalScheme(dataDir), dataDir, h.configPath, wm, syncTick, term.NopInterrupter(),
+		WithAfterConfigMerge(h.afterMerge))
+
+	for _, p := range pkgs {
+		for _, v := range p.versions {
+			require.NoError(t, h.m.InstallPackageVersion(context.Background(),
+				p.id, release.Version(v), repl.NopProgressWriter()))
+		}
+	}
+	h.reset()
+	return h
+}
+
+func (h *startupHost) launch(t *testing.T) {
+	t.Helper()
+	h.reset()
+	require.NoError(t, h.m.ProcessInstalledSettings(context.Background()))
+}
+
+func (h *startupHost) reset() {
+	h.n.Reset()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.asked = nil
+	h.merges = nil
+}
+
+func (h *startupHost) answer(allow bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.allow = allow
+}
+
+func (h *startupHost) prompt(
+	p browserapi.Floating, _ browserapi.FloatingConfig,
+) (browserapi.Window, error) {
+	const width, height = 160, 40
+	p.Resize(width, height)
+	w := term.NewStringWriter(width, height)
+	p.Draw(w)
+	_ = w.Flush()
+	h.mu.Lock()
+	h.asked = append(h.asked, w.String())
+	allow := h.allow
+	h.mu.Unlock()
+	if !allow {
+		p.Handle(term.Event{Type: term.EventKey, Key: term.KeyArrowRight})
+	}
+	p.Handle(term.Event{Type: term.EventKey, Key: term.KeyEnter})
+	return &mockWindow{}, nil
+}
+
+func (h *startupHost) afterMerge(event ConfigMergeEvent) (ConfigMergeResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.merges = append(h.merges, event)
+	return ConfigMergeResult{LivePaths: [][]string{{"gui", "env"}}}, nil
+}
+
+func (h *startupHost) prompts() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.asked)
+}
+
+func (h *startupHost) promptCount() int {
+	return len(h.prompts())
+}
+
+func (h *startupHost) merged() []ConfigMergeEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.merges)
+}
+
+func (h *startupHost) notices() []string {
+	var out []string
+	for _, n := range h.n.Active() {
+		out = append(out, fmt.Sprintf("%v: %s", n.Level, n.Msg))
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (h *startupHost) expand(s string) string {
+	return strings.ReplaceAll(s, "<DATA>", h.dataDir)
+}
+
+func (h *startupHost) writeConfig(t *testing.T, config string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(h.configPath, []byte(h.expand(config)), 0o644))
+	// So a test can tell whether the launch backed the config up.
+	require.NoError(t, os.RemoveAll(h.configPath+".backup"))
+}
+
+func (h *startupHost) readConfig(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(h.configPath)
+	require.NoError(t, err)
+	return string(b)
+}
+
+func startupPackageTarball(t *testing.T, file, config string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	for name, content := range map[string]string{
+		file:             config,
+		"lib/readme.txt": "startpkg\n",
+	} {
+		require.NoError(t, tw.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o644, Size: int64(len(content)),
+		}))
+		_, err := tw.Write([]byte(content))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gzw.Close())
+	return buf.Bytes()
+}
 
 func TestInstallAtomicOperations(t *testing.T) {
 	t.Parallel()
