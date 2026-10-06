@@ -244,7 +244,7 @@ func serveNetworkWorkspaces(
 	if err != nil {
 		return nil, fmt.Errorf("resolve data dir %s: %w", dataDir, err)
 	}
-	scheme, err := workspace.NewFileSchemeFunc(shellRCDir)(
+	scheme, err := workspace.NewFileSchemeFunc(dataDir, shellRCDir)(
 		context.Background(), config.NopConfig(), uri)
 	if err != nil {
 		return nil, fmt.Errorf("root workspace scheme: %w", err)

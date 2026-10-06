@@ -14,22 +14,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//go:build !windows
+//go:build windows
 
-package main
+package hostenv
 
 import (
 	"context"
-	"testing"
+	"os"
 )
 
-func TestLoginShellPATHCmdDetachesFromTerminal(t *testing.T) {
-	cmd := loginShellPATHCmd(context.Background(), "/bin/sh")
-
-	if cmd.Stdin != nil {
-		t.Fatalf("login shell stdin must not be inherited from the terminal")
-	}
-	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setsid {
-		t.Fatalf("login shell must run in a new session (Setsid)")
-	}
+// ProbeLoginPATH returns the current PATH unchanged. Windows has no login
+// shell whose startup files extend PATH, and the probe's POSIX script could
+// only spend its whole timeout failing.
+func ProbeLoginPATH(context.Context, func() (string, error)) (string, error) {
+	return os.Getenv("PATH"), nil
 }

@@ -327,6 +327,25 @@ which Rune has already explained to the user. Other errors, such as permission,
 filesystem, and network failures, usually deserve a visible warning rather
 than a silent fallback.
 
+Keep two directories apart. `DataDir` on the extension's
+[`Workspace`](https://github.com/unstablebuild/rune-go-sdk/blob/main/api/extensionapi/workspace.go)
+is on the machine the extension runs on: use it for the extension's own caches
+and state. Files your package installed are on the workspace host. Find them
+with `FindInstalledExecutable` for `bin/` and `FindInstalledResource` for
+anything else, both of which return paths on the workspace host. Do not join
+`DataDir` with a package path to reach an installed tool: in an SSH workspace
+that path names the wrong machine.
+
+The same applies to `$RUNE_DATADIR` in configuration. A `$RUNE_DATADIR` path
+that your package's config overlay writes into the extension's `config` block
+reaches the extension as written, because only the machine that uses it knows
+where its data directory is. Commands started through the workspace executor
+have `$RUNE_DATADIR` in their path, arguments and environment expanded on the
+workspace host, so such a value can be passed through as is. A path the
+extension resolves itself, for example to stat a file through the workspace
+filesystem, must be expanded against `InstallDir`, the data directory on the
+workspace host that Rune passes in the extension's startup `Config`.
+
 ## 4. Initialize the language server
 
 The extension does not launch the language server and speak LSP itself. It asks

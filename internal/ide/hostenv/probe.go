@@ -14,25 +14,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//go:build windows
+package hostenv
 
-package main
+import "strings"
 
-import (
-	"testing"
-	"time"
-)
+const shellEnvMarker = "RUNE_SHELL_ENV_START"
 
-func TestResolveLoginPathReturnsCurrentPATH(t *testing.T) {
-	t.Setenv("PATH", `C:\Windows;C:\Tools`)
-	got, err := resolveLoginPath(time.Second, func() (string, error) {
-		t.Fatal("the login shell must not be consulted on Windows")
-		return "", nil
-	})
-	if err != nil {
-		t.Fatalf("resolveLoginPath: %v", err)
+func pathFromMarkerEnv(out string) string {
+	if idx := strings.LastIndex(out, shellEnvMarker); idx >= 0 {
+		out = out[idx+len(shellEnvMarker):]
 	}
-	if got != `C:\Windows;C:\Tools` {
-		t.Fatalf("resolveLoginPath() = %q, want the current PATH", got)
+	for entry := range strings.SplitSeq(out, "\x00") {
+		if v, ok := strings.CutPrefix(entry, "PATH="); ok {
+			return v
+		}
 	}
+	return ""
 }

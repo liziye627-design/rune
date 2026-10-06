@@ -68,6 +68,7 @@ import (
 	"unstable.build/rune/internal/ide/console/ideconsole/workspaceshell"
 	"unstable.build/rune/internal/ide/console/llmconsole"
 	"unstable.build/rune/internal/ide/console/pkgconsole"
+	"unstable.build/rune/internal/ide/hostenv"
 	"unstable.build/rune/internal/ide/ideauthorizer"
 	"unstable.build/rune/internal/ide/idecursor"
 	"unstable.build/rune/internal/ide/idedebug"
@@ -198,6 +199,7 @@ type workspaceManagerHandler struct {
 	homeWorkspace       workspace.Workspace
 	empty               *ex
 	homeRunner          extension.Runner
+	homeInstallDir      string
 	homeLSPManager      *idelsp.Manager
 	homeDAPManager      *idedebug.Manager
 	openPrevFiles       []idehistory.File
@@ -768,8 +770,10 @@ func (h *workspaceManagerHandler) init(
 		log.Errorf("build home workspace extensions executor: %v", err)
 		return nil
 	}
+	h.homeInstallDir = installDataDir(trackedCwd, homeDirUri, h.sixDir)
 	runner, lspManager, dapManager, _, _, err := h.buildExtensions(
-		cfg, homeDirUri, trackedCwd, h.empty, extExec, homeParser, false)
+		cfg, homeDirUri, trackedCwd, h.empty, extExec, homeParser, false,
+		h.homeInstallDir)
 	if err != nil {
 		_, _ = h.notifications.current().Notify(browserapi.LevelError,
 			"Error building channel for extensions and plugins: %v", err)
@@ -973,6 +977,12 @@ func (h *workspaceManagerHandler) envSource(name string) (string, bool) {
 		return uri.String(), true
 	case "WORKSPACE_PATH":
 		return uri.Path(), true
+	case hostenv.DataDirVar:
+		dir := h.homeInstallDir
+		if handler := h.workspaces[h.focus]; handler != nil {
+			dir = handler.installDir
+		}
+		return dir, dir != ""
 	}
 	return "", false
 }
@@ -1944,6 +1954,7 @@ func (h *workspaceManagerHandler) buildWorkspaceAsync(
 		uri:                 uri,
 		ex:                  ex,
 		cwd:                 cwd,
+		installDir:          installDataDir(cwd, uri, h.sixDir),
 	}
 	tm.workspace = wh
 
@@ -1963,7 +1974,7 @@ func (h *workspaceManagerHandler) buildWorkspaceAsync(
 		return nil, fmt.Errorf("new extensions executor: %w", err)
 	}
 	runner, lspManager, dapManager, hostPkgs, promptStorage, err := h.buildExtensions(
-		cfg, uri, trackedCwd, ex, extExec, wsParser, symbolDB != nil)
+		cfg, uri, trackedCwd, ex, extExec, wsParser, symbolDB != nil, wh.installDir)
 	if err != nil {
 		_, _ = h.notifications.current().Notify(browserapi.LevelError,
 			"Error building channel for extensions and plugins: %v", err)
@@ -2222,10 +2233,13 @@ func lspConfig(cfg ideConfig) config.Config {
 	return config.MapConfig(ret)
 }
 
+// buildExtensions wires the extensions, language servers and debuggers of
+// the workspace at uri. installDir is the Rune data directory of the
+// workspace's host, as resolved by installDataDir.
 func (h *workspaceManagerHandler) buildExtensions(
 	cfg ideConfig, uri workspaceapi.URI,
 	cwd workspace.Workspace, ex *ex, extExecutor *extensionsExecutor,
-	parser syntaxapi.Parser, indexedSymbols bool,
+	parser syntaxapi.Parser, indexedSymbols bool, installDir string,
 ) (
 	_ extension.Runner, _ *idelsp.Manager, _ *idedebug.Manager,
 	_ *pkgManager, _ storageapi.Service, retErr error,
@@ -2313,7 +2327,10 @@ func (h *workspaceManagerHandler) buildExtensions(
 	}
 	dapCfg := idedebug.Config{
 		MaxRetries: 5,
-		Adapters:   cfg.debuggerConfigs(),
+		// Adapters run on the workspace host and their launch arguments
+		// go straight to them, so no command executor expands
+		// $RUNE_DATADIR in them on the way.
+		Adapters: expandAdapterDataDir(cfg.debuggerConfigs(), installDir),
 	}
 	dap := idedebug.New(rootURI, cwd, pkgs, dapCfg)
 	defer func() {
@@ -2410,10 +2427,6 @@ func (h *workspaceManagerHandler) buildExtensions(
 	if err := os.MkdirAll(dataDir, 0777); err != nil {
 		return nil, nil, nil, nil, nil, fmt.Errorf("mkdir %s: %v", dataDir, err)
 	}
-	// installDir is where the IDE provisions per-extension toolchains on the
-	// workspace host. Extensions resolve provisioned binaries under it via
-	// FindInstalledExecutable.
-	installDir := installDataDir(cwd, uri, dataDir)
 	browser := ex.Browser()
 	grantor := newExtensionPromptGrantor(promptOpener, promptStorage,
 		cfg.scheduleNextTick, h.trust)
@@ -2496,6 +2509,34 @@ func (h *workspaceManagerHandler) swapDirectory(
 			return ""
 		}
 	}
+}
+
+// expandAdapterDataDir returns adapters with $RUNE_DATADIR in their
+// commands and launch and attach arguments expanded to installDir.
+func expandAdapterDataDir(
+	adapters map[string]idedebug.AdapterConfig, installDir string,
+) map[string]idedebug.AdapterConfig {
+	expandArgs := func(args map[string]string) map[string]string {
+		if args == nil {
+			return nil
+		}
+		out := make(map[string]string, len(args))
+		for k, v := range args {
+			out[k] = hostenv.ExpandDataDir(v, installDir)
+		}
+		return out
+	}
+	for id, a := range adapters {
+		command := make([]string, len(a.Command))
+		for i, arg := range a.Command {
+			command[i] = hostenv.ExpandDataDir(arg, installDir)
+		}
+		a.Command = command
+		a.LaunchArgs = expandArgs(a.LaunchArgs)
+		a.AttachArgs = expandArgs(a.AttachArgs)
+		adapters[id] = a
+	}
+	return adapters
 }
 
 func installDataDir(ws workspace.Workspace, uri workspaceapi.URI, localDataDir string) string {
@@ -3195,6 +3236,8 @@ type workspaceHandler struct {
 	dapManager          *idedebug.Manager
 	hostPackages        *pkgManager
 	promptStorage       storageapi.Service
+	// installDir is the Rune data directory of the workspace's host.
+	installDir string
 }
 
 func (hm *workspaceHandler) Close() error {

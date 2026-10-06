@@ -396,8 +396,8 @@ func TestInstallAsksTheClient(t *testing.T) {
 		return fmt.Sprintf("notify %d saved configpkg configuration updates to your config. "+
 			"None are in effect yet; restart the program to load: %s.", level, keys)
 	}
-	v1GOROOT := filepath.Join(dataDir, "pkg", "configpkg", "1", "go")
-	v2GOROOT := filepath.Join(dataDir, "pkg", "configpkg", "2", "go")
+	const v1GOROOT = "$RUNE_DATADIR/pkg/configpkg/1/go"
+	const v2GOROOT = "$RUNE_DATADIR/pkg/configpkg/2/go"
 
 	require.NoError(t, c.InstallPackageVersion(ctx, "configpkg", "1", nil))
 	assert.Equal(t, []string{
@@ -460,7 +460,7 @@ func TestPeerInstallAsksThePeer(t *testing.T) {
 	events.answer(t, 0, true)
 	events.await(t, fmt.Sprintf("notify %d saved configpkg configuration updates to your config. "+
 		"None are in effect yet; restart the program to load: env.GOROOT.", browserapi.LevelSuccess))
-	assert.Equal(t, filepath.Join(dataDir, "pkg", "configpkg", "2", "go"), hostGOROOT(t, dataDir))
+	assert.Equal(t, "$RUNE_DATADIR/pkg/configpkg/2/go", hostGOROOT(t, dataDir))
 	assert.Empty(t, own.Active(), "nothing is notified to the node's own user")
 }
 

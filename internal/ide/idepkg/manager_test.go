@@ -1500,7 +1500,7 @@ func TestInstallPackageVersionConfig(t *testing.T) {
 		doc := readUserConfig(t, datadir)
 		root := doc.Content[0]
 		assertNestedYAMLKey(t, root, "env", "GOROOT",
-			datadir+"/pkg/configpkg/1/go")
+			"$RUNE_DATADIR/pkg/configpkg/1/go")
 		assertNestedYAMLKey(t, root, "settings", "theme", "dark")
 		assertNestedYAMLKey(t, root, "settings", "indent", "4")
 	})
@@ -1517,7 +1517,7 @@ func TestInstallPackageVersionConfig(t *testing.T) {
 		doc := readUserConfig(t, datadir)
 		root := doc.Content[0]
 		assertNestedYAMLKey(t, root, "env", "GOROOT",
-			datadir+"/pkg/configpkg/1/go")
+			"$RUNE_DATADIR/pkg/configpkg/1/go")
 	})
 }
 
@@ -1556,7 +1556,7 @@ func TestUsePackageVersionConfig(t *testing.T) {
 		doc := readUserConfig(t, datadir)
 		root := doc.Content[0]
 		assertNestedYAMLKey(t, root, "env", "GOROOT",
-			datadir+"/pkg/configpkg/1/go")
+			"$RUNE_DATADIR/pkg/configpkg/1/go")
 		assertNestedYAMLKey(t, root, "settings", "theme", "dark")
 		assertNestedYAMLKey(t, root, "settings", "indent", "4")
 
@@ -1596,7 +1596,7 @@ func TestProcessInstalledSettingsConfig(t *testing.T) {
 		doc := readUserConfig(t, datadir)
 		root := doc.Content[0]
 		assertNestedYAMLKey(t, root, "env", "GOROOT",
-			datadir+"/pkg/configpkg/1/go")
+			"$RUNE_DATADIR/pkg/configpkg/1/go")
 		assertNestedYAMLKey(t, root, "settings", "theme", "dark")
 	})
 	t.Run("seeds and merges when no user config exists", func(t *testing.T) {
@@ -1614,7 +1614,7 @@ func TestProcessInstalledSettingsConfig(t *testing.T) {
 		doc := readUserConfig(t, datadir)
 		root := doc.Content[0]
 		assertNestedYAMLKey(t, root, "env", "GOROOT",
-			datadir+"/pkg/configpkg/1/go")
+			"$RUNE_DATADIR/pkg/configpkg/1/go")
 	})
 }
 
@@ -1683,7 +1683,7 @@ func TestInstallPackageVersionConfigCrossFormat(t *testing.T) {
 
 			env, ok := cfg["env"].(map[string]any)
 			require.True(t, ok)
-			assert.Equal(t, filepath.Join(datadir, "pkg", tt.pkgName, "1", "go"), env["GOROOT"])
+			assert.Equal(t, "$RUNE_DATADIR/pkg/"+tt.pkgName+"/1/go", env["GOROOT"])
 
 			settings, ok := cfg["settings"].(map[string]any)
 			require.True(t, ok)
@@ -1753,7 +1753,7 @@ func TestInstallPackageVersionConfigEmptyUserConfig(t *testing.T) {
 
 			env, ok := cfg["env"].(map[string]any)
 			require.True(t, ok, "env not present in merged config: %#v", cfg)
-			assert.Equal(t, filepath.Join(datadir, "pkg", tt.pkgName, "1", "go"), env["GOROOT"])
+			assert.Equal(t, "$RUNE_DATADIR/pkg/"+tt.pkgName+"/1/go", env["GOROOT"])
 
 			settings, ok := cfg["settings"].(map[string]any)
 			require.True(t, ok, "settings not present in merged config: %#v", cfg)
@@ -1808,10 +1808,10 @@ func TestInstallConfigExtensionPathPrompt(t *testing.T) {
 
 			pkgs := idepkgtest.MakePackages()
 			versions := idepkgtest.MakeBundles([]release.Bundle{{Package: pkgID, Version: "1"}})
-			m, n, rm, datadir := newTestManager(t, pkgs, versions)
+			m, n, rm, _ := newTestManager(t, pkgs, versions)
 
 			oldPath := "/usr/local/bin/rune-agent"
-			newPath := filepath.Join(datadir, "bin", pkgID)
+			newPath := "$RUNE_DATADIR/bin/" + pkgID
 			userConfig := fmt.Sprintf("extensions:\n  %s:\n    path: %q\n", pkgID, oldPath)
 			require.NoError(t, os.WriteFile(m.configPath, []byte(userConfig), 0o644))
 
@@ -1910,7 +1910,7 @@ func TestInstallPackageVersionConfigMissingUserConfig(t *testing.T) {
 	cfg := readUserConfigMap(t, configPath)
 	env, ok := cfg["env"].(map[string]any)
 	require.True(t, ok, "env not merged into a fresh (missing) user config: %#v", cfg)
-	assert.Equal(t, filepath.Join(datadir, "pkg", "configpkg", "1", "go"), env["GOROOT"])
+	assert.Equal(t, "$RUNE_DATADIR/pkg/configpkg/1/go", env["GOROOT"])
 }
 
 func TestProcessConfigSequentialDistinctPackages(t *testing.T) {
@@ -2125,7 +2125,7 @@ func TestInstallAsksTheUIOfItsContext(t *testing.T) {
 	ui.answers[0](true)
 
 	merged := readUserConfigMap(t, configPath)
-	assert.Equal(t, filepath.Join(datadir, "pkg", "configpkg", "2", "go"),
+	assert.Equal(t, "$RUNE_DATADIR/pkg/configpkg/2/go",
 		merged["env"].(map[string]any)["GOROOT"])
 	assert.Equal(t, "added", fmt.Sprint(merged["settings"].(map[string]any)["newkey"]))
 	assert.Equal(t, "kept", merged["other"])
@@ -2179,7 +2179,7 @@ func TestInstallConfigPreservesUserValues(t *testing.T) {
 		cfg := readUserConfigMap(t, configPath)
 		env, ok := cfg["env"].(map[string]any)
 		require.True(t, ok)
-		wantGOROOT := filepath.Join(datadir, "pkg", "configpkg", "1", "go")
+		wantGOROOT := "$RUNE_DATADIR/pkg/configpkg/1/go"
 		assert.Equal(t, wantGOROOT, fmt.Sprint(env["GOROOT"]),
 			"version-dependent GOROOT updates to the resolved value")
 		settings, ok := cfg["settings"].(map[string]any)
@@ -2229,7 +2229,7 @@ func TestInstallConfigPreservesUserValues(t *testing.T) {
 		cfg := readUserConfigMap(t, configPath)
 		env, ok := cfg["env"].(map[string]any)
 		require.True(t, ok)
-		wantGOROOT := filepath.Join(datadir, "pkg", "configpkg", "2", "go")
+		wantGOROOT := "$RUNE_DATADIR/pkg/configpkg/2/go"
 		assert.Equal(t, wantGOROOT, fmt.Sprint(env["GOROOT"]),
 			"version-dependent GOROOT updates to the v2 resolved value")
 		settings, ok := cfg["settings"].(map[string]any)
@@ -3082,7 +3082,7 @@ func TestProcessConfigRepromptsOnVersionDependentChange(t *testing.T) {
 			{Package: "vpkg", Version: "1"},
 			{Package: "vpkg", Version: "2"},
 		})
-		m, _, _, datadir := newTestManager(t, pkgs, versions)
+		m, _, _, _ := newTestManager(t, pkgs, versions)
 
 		require.NoError(t, os.WriteFile(m.configPath, []byte("{}\n"), 0o644))
 
@@ -3106,7 +3106,7 @@ func TestProcessConfigRepromptsOnVersionDependentChange(t *testing.T) {
 		require.NoError(t, m.processConfig(context.Background(), "vpkg", release.Version("1"), pkgConfig))
 		assert.Equal(t, 0, promptCount, "first install auto-applies the new key without prompting")
 
-		v1Want := filepath.Join(datadir, "pkg", "vpkg", "1", "go")
+		v1Want := "$RUNE_DATADIR/pkg/vpkg/1/go"
 		cfg := readUserConfigMap(t, m.configPath)
 		env, ok := cfg["env"].(map[string]any)
 		require.True(t, ok)
@@ -3116,7 +3116,7 @@ func TestProcessConfigRepromptsOnVersionDependentChange(t *testing.T) {
 		require.NoError(t, m.processConfig(context.Background(), "vpkg", release.Version("2"), pkgConfig))
 		assert.Equal(t, 1, promptCount, "version bump re-prompts the version-dependent key")
 
-		v2Want := filepath.Join(datadir, "pkg", "vpkg", "2", "go")
+		v2Want := "$RUNE_DATADIR/pkg/vpkg/2/go"
 		cfg = readUserConfigMap(t, m.configPath)
 		env, ok = cfg["env"].(map[string]any)
 		require.True(t, ok)
@@ -3470,8 +3470,7 @@ else:
 		t.Run(tc.mode, func(t *testing.T) {
 			got, err := loadIdePkgConfigFromBytes(
 				"config.star", []byte(src),
-				nil, "pkg", release.Version("1"), "/data",
-				tc.mode,
+				nil, "pkg", release.Version("1"), tc.mode,
 			)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantMod, got["picked_mode"])
@@ -3541,7 +3540,7 @@ func TestLoadUserConfigStarEmptyOrCommentsOnly(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := loadIdePkgConfigFromBytes(
 				"config.star", []byte(tc.src),
-				nil, "pkg", release.Version("1"), "/data", "modal",
+				nil, "pkg", release.Version("1"), "modal",
 			)
 			require.NoError(t, err)
 			assert.Equal(t, map[string]any{}, got)
@@ -4206,13 +4205,13 @@ func TestConfigMergeIntegration(t *testing.T) {
 		assert.Equal(t, 0, promptCount, "first install auto-applies the new key without prompting")
 		cfg := readUserConfigMap(t, m.configPath)
 		env := cfg["env"].(map[string]any)
-		assert.Equal(t, filepath.Join(datadir, "pkg", "vpkg", "1", "go"), fmt.Sprint(env["GOROOT"]))
+		assert.Equal(t, "$RUNE_DATADIR/pkg/vpkg/1/go", fmt.Sprint(env["GOROOT"]))
 
 		require.NoError(t, m.processConfig(context.Background(), "vpkg", release.Version("2"), pkgConfig))
 		assert.Equal(t, 1, promptCount, "version bump re-prompts the version-dependent key")
 		cfg = readUserConfigMap(t, m.configPath)
 		env = cfg["env"].(map[string]any)
-		assert.Equal(t, filepath.Join(datadir, "pkg", "vpkg", "2", "go"), fmt.Sprint(env["GOROOT"]))
+		assert.Equal(t, "$RUNE_DATADIR/pkg/vpkg/2/go", fmt.Sprint(env["GOROOT"]))
 
 		raw, err := os.ReadFile(m.configPath)
 		require.NoError(t, err)
@@ -4791,8 +4790,7 @@ func TestInstallPackagePreservesStarConfigComments(t *testing.T) {
 			cfg := readUserConfigMap(t, configPath)
 			env, ok := cfg["env"].(map[string]any)
 			require.True(t, ok, "env not merged: %#v", cfg)
-			assert.Equal(t, filepath.Join(
-				filepath.Dir(configPath), "pkg", "configpkg", "2", "go"),
+			assert.Equal(t, "$RUNE_DATADIR/pkg/configpkg/2/go",
 				env["GOROOT"])
 		})
 	}
@@ -4830,7 +4828,7 @@ func TestUpgradePackagePreservesUserConfigComments(t *testing.T) {
 	cfg := readUserConfigMap(t, configPath)
 	env, ok := cfg["env"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, filepath.Join(datadir, "pkg", "configpkg", "2", "go"),
+	assert.Equal(t, "$RUNE_DATADIR/pkg/configpkg/2/go",
 		env["GOROOT"], "the approved version-dependent key must be updated")
 }
 

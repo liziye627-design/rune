@@ -126,7 +126,7 @@ func TestRunnerSharesOneCertAcrossWorkspaces(t *testing.T) {
 		require.NoError(t, err)
 		runner, err := newTestWorkspaceExtensionsRunner(t, r, uri)
 		require.NoError(t, err)
-		env, err := runner.(wrapCloser).commandEnvs(context.Background(), "ext", nil)
+		env, err := runner.(wrapCloser).commandEnvs(context.Background(), "ext", nil, "")
 		require.NoError(t, err)
 		certs = append(certs, envValue(env, "RUNE_CERT"))
 	}
@@ -164,7 +164,7 @@ func TestRunnerInsecureTransportSkipsCertGeneration(t *testing.T) {
 	require.NoError(t, err)
 	runner, err := newTestWorkspaceExtensionsRunner(t, r, uri)
 	require.NoError(t, err)
-	env, err := runner.(wrapCloser).commandEnvs(context.Background(), "ext", nil)
+	env, err := runner.(wrapCloser).commandEnvs(context.Background(), "ext", nil, "")
 	require.NoError(t, err)
 	assert.Empty(t, envValue(env, "RUNE_CERT"))
 }

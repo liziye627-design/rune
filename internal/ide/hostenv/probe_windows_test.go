@@ -16,16 +16,23 @@
 
 //go:build windows
 
-package main
+package hostenv
 
 import (
-	"os"
-	"time"
+	"context"
+	"testing"
 )
 
-// resolveLoginPath returns the current PATH unchanged. Windows has no login
-// shell whose startup files extend PATH, and the probe's POSIX script could
-// only spend its whole timeout failing.
-func resolveLoginPath(time.Duration, func() (string, error)) (string, error) {
-	return os.Getenv("PATH"), nil
+func TestProbeLoginPATHReturnsCurrentPATH(t *testing.T) {
+	t.Setenv("PATH", `C:\Windows;C:\Tools`)
+	got, err := ProbeLoginPATH(context.Background(), func() (string, error) {
+		t.Fatal("the login shell must not be consulted on Windows")
+		return "", nil
+	})
+	if err != nil {
+		t.Fatalf("ProbeLoginPATH: %v", err)
+	}
+	if got != `C:\Windows;C:\Tools` {
+		t.Fatalf("ProbeLoginPATH() = %q, want the current PATH", got)
+	}
 }

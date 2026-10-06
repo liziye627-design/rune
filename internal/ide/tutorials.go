@@ -39,7 +39,7 @@ import (
 const tutorialPlaylistPromptDelay = 3 * time.Second
 
 func buildTutorials(i *IDE) map[string]idetutorial.Tutorial {
-	files := i.ideConfig.tutorialFiles()
+	files := i.ideConfig.tutorialFiles(i.workspaceHandler.sixDir)
 	embedded := i.options.starlarkTutorials
 	i.tutorialsConfig = newTutorialsConfig(i)
 	if len(files) == 0 && len(embedded) == 0 {
@@ -90,7 +90,7 @@ func (i *IDE) onTutorialsInstalled(names []string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reload config for installed tutorials: %w", err)
 	}
-	files := cfg.tutorialFiles()
+	files := cfg.tutorialFiles(i.workspaceHandler.sixDir)
 
 	type built struct {
 		name string

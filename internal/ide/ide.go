@@ -595,7 +595,7 @@ func (i *IDE) init(
 		return fmt.Errorf("register ssh scheme: %w", err)
 	}
 	err = workspaceManager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileSchemeFunc(op.shellRCDir))
+		workspace.NewFileSchemeFunc(op.hostDataDir, op.shellRCDir))
 	if err != nil {
 		return fmt.Errorf("register file scheme: %w", err)
 	}

@@ -50,6 +50,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"gopkg.in/yaml.v3"
 	"unstable.build/rune/internal/debug"
+	"unstable.build/rune/internal/ide/hostenv"
 	"unstable.build/rune/internal/ide/idepkg/gitpkg"
 	"unstable.build/rune/internal/ide/idepkg/pkgtrust"
 	"unstable.build/rune/internal/ide/starlarkconfig"
@@ -858,7 +859,7 @@ func (m *Manager) installRequirements(
 		return fmt.Errorf("read staged config: %w", err)
 	}
 	reqs, err := pkgConfigRequirements(
-		configFile, data, pkgID, version, m.dataDir, m.editorMode,
+		configFile, data, pkgID, version, m.editorMode,
 	)
 	if err != nil {
 		return fmt.Errorf("parse requirements: %w", err)
@@ -1320,7 +1321,7 @@ func loadIdePkgConfigFile(path string, base map[string]any) (map[string]any, err
 	if err != nil {
 		return nil, err
 	}
-	return loadIdePkgConfigFromBytes(path, data, base, "", "", "", "")
+	return loadIdePkgConfigFromBytes(path, data, base, "", "", "")
 }
 
 // configBaseTree returns the editor's default config tree to predeclare as
@@ -1377,14 +1378,13 @@ func loneSubdir(dir string) (string, bool) {
 	return filepath.Join(dir, entries[0].Name()), true
 }
 
+// idePkgStarlarkParams binds RUNE_DATADIR to its own placeholder so a
+// config.star that builds paths from it yields "$RUNE_DATADIR/..." and the
+// host that uses the value resolves it.
 func idePkgStarlarkParams(
-	pkgID string, pkgVersion release.Version, dataDir string,
-	editorMode string,
+	pkgID string, pkgVersion release.Version, editorMode string,
 ) map[string]any {
-	params := map[string]any{}
-	if dataDir != "" {
-		params["RUNE_DATADIR"] = dataDir
-	}
+	params := map[string]any{"RUNE_DATADIR": "$" + hostenv.DataDirVar}
 	if pkgID != "" {
 		params["RUNE_PKG_ID"] = pkgID
 	}
@@ -1399,8 +1399,7 @@ func idePkgStarlarkParams(
 
 func loadIdePkgConfigFromBytes(
 	filename string, data []byte, base map[string]any,
-	pkgID string, pkgVersion release.Version, dataDir string,
-	editorMode string,
+	pkgID string, pkgVersion release.Version, editorMode string,
 ) (map[string]any, error) {
 	if strings.HasSuffix(strings.ToLower(filename), ".star") {
 		// User configs are authored as overlays that mutate a
@@ -1414,7 +1413,7 @@ func loadIdePkgConfigFromBytes(
 		cfg, err := starlarkconfig.Decode(starlarkconfig.Source{
 			Src:      data,
 			Filename: filename,
-			Params:   idePkgStarlarkParams(pkgID, pkgVersion, dataDir, editorMode),
+			Params:   idePkgStarlarkParams(pkgID, pkgVersion, editorMode),
 			Base:     base,
 		})
 		if errors.Is(err, starlarkconfig.ErrMissingConfig) {
@@ -1434,19 +1433,18 @@ func loadIdePkgConfigFromBytes(
 
 func loadIdePkgConfigOverlay(
 	filename string, data []byte, base map[string]any,
-	pkgID string, pkgVersion release.Version, dataDir string,
-	editorMode string,
+	pkgID string, pkgVersion release.Version, editorMode string,
 ) (map[string]any, error) {
 	if strings.HasSuffix(strings.ToLower(filename), ".star") {
 		return starlarkconfig.Decode(starlarkconfig.Source{
 			Src:      data,
 			Filename: filename,
-			Params:   idePkgStarlarkParams(pkgID, pkgVersion, dataDir, editorMode),
+			Params:   idePkgStarlarkParams(pkgID, pkgVersion, editorMode),
 			Base:     base,
 		})
 	}
 	return loadIdePkgConfigFromBytes(filename, data, base, pkgID, pkgVersion,
-		dataDir, editorMode)
+		editorMode)
 }
 
 func normalizeIdePkgConfig(v any) any {
@@ -1477,8 +1475,11 @@ func normalizeIdePkgConfig(v any) any {
 // idePkgConfigDiff classifies overlay keys against the user config into two
 // disjoint subsets:
 //
-//   - newCfg: overlay key paths absent from the user config. These can be
-//     auto-applied without prompting.
+//   - newCfg: overlay key paths absent from the user config, plus user values
+//     that only differ from the overlay in spelling the data directory (an
+//     absolute path where the overlay has $RUNE_DATADIR, written by releases
+//     that expanded it at install time). These can be auto-applied without
+//     prompting.
 //   - conflictCfg: overlay scalar leaves that already exist in the user config
 //     with a different value and must be approved. Outside gui.env only
 //     version-dependent leaves qualify (RUNE-225); under gui.env every
@@ -1489,7 +1490,7 @@ func normalizeIdePkgConfig(v any) any {
 // Either returned map is nil when its subset is empty.
 func idePkgConfigDiff(
 	user, overlay map[string]any, versionDependent map[string]any,
-	keyPath []string,
+	dataDir string, keyPath []string,
 ) (newCfg, conflictCfg map[string]any) {
 	for key, overlayVal := range overlay {
 		userVal, ok := user[key]
@@ -1503,24 +1504,35 @@ func idePkgConfigDiff(
 		overlayMap, overlayIsMap := overlayVal.(map[string]any)
 		userMap, userIsMap := userVal.(map[string]any)
 		if !overlayIsMap || !userIsMap {
-			if isScalar(userVal) && isScalar(overlayVal) {
-				conflictVal, conflict := scalarConflict(
+			var val any
+			change := valueSame
+			switch {
+			case isScalar(userVal) && isScalar(overlayVal):
+				val, change = scalarChange(
 					append(keyPath, key),
 					isVersionDependentScalar(versionDependent, key),
-					userVal, overlayVal,
+					userVal, overlayVal, dataDir,
 				)
-				if conflict {
-					if conflictCfg == nil {
-						conflictCfg = map[string]any{}
-					}
-					conflictCfg[key] = conflictVal
+			case listRespelled(userVal, overlayVal, dataDir):
+				val, change = overlayVal, valueRespelled
+			}
+			switch change {
+			case valueRespelled:
+				if newCfg == nil {
+					newCfg = map[string]any{}
 				}
+				newCfg[key] = val
+			case valueConflict:
+				if conflictCfg == nil {
+					conflictCfg = map[string]any{}
+				}
+				conflictCfg[key] = val
 			}
 			continue
 		}
 		nestedVersionDependent, _ := versionDependent[key].(map[string]any)
 		nestedNew, nestedConflict := idePkgConfigDiff(
-			userMap, overlayMap, nestedVersionDependent, append(keyPath, key),
+			userMap, overlayMap, nestedVersionDependent, dataDir, append(keyPath, key),
 		)
 		if nestedNew != nil {
 			if newCfg == nil {
@@ -1538,25 +1550,79 @@ func idePkgConfigDiff(
 	return newCfg, conflictCfg
 }
 
-func scalarConflict(
-	keyPath []string, versionDependent bool, userVal, overlayVal any,
-) (any, bool) {
+type valueChange int
+
+const (
+	// valueSame keeps the user value.
+	valueSame valueChange = iota
+	// valueRespelled replaces the user value without asking: it names the
+	// same thing as the overlay once $RUNE_DATADIR is expanded locally.
+	valueRespelled
+	// valueConflict replaces the user value only with the user's approval.
+	valueConflict
+)
+
+func scalarChange(
+	keyPath []string, versionDependent bool, userVal, overlayVal any, dataDir string,
+) (any, valueChange) {
 	if isGUIEnvPathLeaf(keyPath) {
-		merged, changed := mergePathValue(
-			fmt.Sprint(userVal), fmt.Sprint(overlayVal),
+		merged, respelled, added := mergePathValue(
+			fmt.Sprint(userVal), fmt.Sprint(overlayVal), dataDir,
 		)
-		if !changed {
-			return nil, false
+		switch {
+		case added:
+			return merged, valueConflict
+		case respelled:
+			return merged, valueRespelled
 		}
-		return merged, true
+		return nil, valueSame
 	}
-	if fmt.Sprint(overlayVal) == fmt.Sprint(userVal) {
-		return nil, false
+	userStr, overlayStr := fmt.Sprint(userVal), fmt.Sprint(overlayVal)
+	if overlayStr == userStr {
+		return nil, valueSame
+	}
+	if sameAfterDataDir(userStr, overlayStr, dataDir) {
+		return overlayVal, valueRespelled
 	}
 	if isGUIEnvLeaf(keyPath) || versionDependent {
-		return overlayVal, true
+		return overlayVal, valueConflict
 	}
-	return nil, false
+	return nil, valueSame
+}
+
+// sameAfterDataDir reports whether the user and overlay spellings name the
+// same value on this host once $RUNE_DATADIR is expanded with dataDir.
+func sameAfterDataDir(userStr, overlayStr, dataDir string) bool {
+	return dataDir != "" &&
+		hostenv.ExpandDataDir(userStr, dataDir) == hostenv.ExpandDataDir(overlayStr, dataDir)
+}
+
+// listRespelled reports whether two lists of scalars differ, but only in how
+// their elements spell the data directory.
+func listRespelled(userVal, overlayVal any, dataDir string) bool {
+	userList, ok := userVal.([]any)
+	if !ok {
+		return false
+	}
+	overlayList, ok := overlayVal.([]any)
+	if !ok || len(userList) != len(overlayList) {
+		return false
+	}
+	differ := false
+	for i := range overlayList {
+		if !isScalar(userList[i]) || !isScalar(overlayList[i]) {
+			return false
+		}
+		userStr, overlayStr := fmt.Sprint(userList[i]), fmt.Sprint(overlayList[i])
+		if userStr == overlayStr {
+			continue
+		}
+		if !sameAfterDataDir(userStr, overlayStr, dataDir) {
+			return false
+		}
+		differ = true
+	}
+	return differ
 }
 
 func isGUIEnvLeaf(keyPath []string) bool {
@@ -1581,9 +1647,14 @@ func isScalar(v any) bool {
 	}
 }
 
-func mergePathValue(userPath, pkgPath string) (string, bool) {
+// mergePathValue merges the package's PATH chunks into the user's. A user
+// chunk that names the same directory as a package chunk once $RUNE_DATADIR
+// is expanded with dataDir is rewritten in place to the package spelling
+// (respelled); package chunks the user lacks are prepended in package order
+// (added).
+func mergePathValue(userPath, pkgPath, dataDir string) (merged string, respelled, added bool) {
 	if pkgPath == "" {
-		return userPath, false
+		return userPath, false, false
 	}
 	userChunks := strings.Split(userPath, ":")
 	present := make(map[string]struct{}, len(userChunks))
@@ -1596,15 +1667,33 @@ func mergePathValue(userPath, pkgPath string) (string, bool) {
 			continue
 		}
 		present[chunk] = struct{}{}
+		if i := respelledChunk(userChunks, chunk, dataDir); i >= 0 {
+			userChunks[i] = chunk
+			respelled = true
+			continue
+		}
 		missing = append(missing, chunk)
 	}
+	userPath = strings.Join(userChunks, ":")
 	if len(missing) == 0 {
-		return userPath, false
+		return userPath, respelled, false
 	}
 	if userPath == "" {
-		return strings.Join(missing, ":"), true
+		return strings.Join(missing, ":"), respelled, true
 	}
-	return strings.Join(missing, ":") + ":" + userPath, true
+	return strings.Join(missing, ":") + ":" + userPath, respelled, true
+}
+
+func respelledChunk(userChunks []string, pkgChunk, dataDir string) int {
+	if !strings.Contains(pkgChunk, hostenv.DataDirVar) {
+		return -1
+	}
+	for i, chunk := range userChunks {
+		if chunk != pkgChunk && sameAfterDataDir(chunk, pkgChunk, dataDir) {
+			return i
+		}
+	}
+	return -1
 }
 
 func versionDependentKeys(overlay map[string]any) map[string]any {
@@ -1640,14 +1729,14 @@ const versionDependentSentinel = "\x00rune-version-sentinel\x00"
 
 func versionDependentOverlayKeys(
 	filename string, data []byte, overlay map[string]any,
-	pkgID string, dataDir, editorMode string,
+	pkgID, editorMode string,
 ) (map[string]any, error) {
 	if !strings.HasSuffix(strings.ToLower(filename), ".star") {
 		return versionDependentKeys(overlay), nil
 	}
 	sentinel, err := loadIdePkgConfigOverlay(
 		filename, data, map[string]any{},
-		pkgID, versionDependentSentinel, dataDir, editorMode,
+		pkgID, versionDependentSentinel, editorMode,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("decode package config (version probe): %w", err)
