@@ -539,7 +539,8 @@ func runTUI(
 	client, releaseManager := newAPIClient(storage, os.TempDir(), rootCfg)
 	defer client.Close()
 
-	net := newNetwork(rootCfg, *flagDataPath, shellRCDir, newNetworkGate(client))
+	net := newNetwork(rootCfg, *flagDataPath, newNetworkGate(client),
+		workspaceServerCommand(*flagDataPath, *flagConfigPath))
 	net.startAutoJoin()
 	defer func() {
 		_ = net.Close()
@@ -566,7 +567,7 @@ func runTUI(
 		log.Errorf("register network: %v", err)
 	}
 
-	err = subscribeOtherCommands(i, client, *flagConfigPath)
+	err = subscribeOtherCommands(i, client, net, *flagConfigPath)
 	if err != nil {
 		log.Errorf("subscribe to commands: %v", err)
 	}

@@ -32,15 +32,19 @@ the code.
   limit, remove a node with `network remove` or upgrade your plan;
   after upgrading, run `login` again so the machine picks up the new
   plan.
-- **Rune running on both machines, signed into the same account.** A
-  machine serves its workspaces from the Rune instance running on it. If
-  Rune is not open there, the machine is not reachable, and only your own
-  machines are ever allowed to connect. A machine nobody sits at can run
-  Rune as a service instead; see [Headless](./headless.md).
+- **Rune on both machines, signed into the same account.** A machine
+  serves its workspaces from its workspace server, the background process
+  Rune starts the first time you open it, so the machine stays reachable
+  after you close every window. Only your own machines are ever allowed
+  to connect. A machine nobody sits at can run that server as a service
+  instead; see [Headless](./headless.md).
 
 ## Joining the network
 
-Rune joins on startup, so usually there is nothing to do. Check where
+Rune joins when it starts, so usually there is nothing to do. The node
+lives in the machine's workspace server, not in the editor window: once
+it has joined, closing Rune leaves the machine on the network, and
+another machine can still open `rune://<this-machine>/`. Check where
 this machine stands with `network status` in the console:
 
 ```
@@ -55,7 +59,11 @@ prints a URL to open in a browser to authorize the machine.
 To join without restarting, or after a `network down`, run `network up`.
 It waits until the machine is a member and then prints the status. If
 joining takes longer than 30 seconds, Rune tells you so and keeps trying
-in the background; run `network status` to see how it went.
+in the background; run `network status` to see how it went. Both
+commands act on the machine, not on the window you run them in: a
+`network down` in one Rune window takes the machine off the network for
+every window, and `logout` does the same. Signing in again with `login`
+puts it back when `network.auto_join` is on.
 
 ### The `network` command
 
@@ -70,7 +78,7 @@ run it as `network <subcommand>`, or submit a one-off from the
 | `network machines` | List every machine registered to your account, whether or not it is on the network right now, and which one you are on. |
 | `network remove <machine>` | Unregister a machine from your account, freeing the slot it held. |
 | `network up` | Join the network and wait until this machine is a member. |
-| `network down` | Leave the network. Open `rune://` workspaces stop working until you run `network up` again. |
+| `network down` | Leave the network, for every Rune window on this machine. Open `rune://` workspaces stop working until you run `network up` again. |
 | `network help` | Show the command's usage. |
 
 ## How many machines you can have
@@ -161,6 +169,14 @@ own and the workspace carries on. Two failures are final rather than
 retried, because retrying cannot fix them: a machine that is not on the
 network at all, and one that belongs to a different account.
 
+Terminals you open in a `rune://` workspace belong to the other
+machine's workspace server, the same way the terminals of an
+[SSH workspace](./ssh.md) do. Quit Rune and open the workspace again,
+from this machine or another, and the same terminals are still running,
+with the same processes in them. Images a program drew in such a
+terminal are not kept with it: reopening brings back its text, and the
+program has to draw its images again.
+
 ### Completing machines and directories
 
 Typing `rune://` at the `workspaceopen` prompt lists the machines that
@@ -208,8 +224,8 @@ install packages, Rune asks you to update Rune there.
 
 A build box or a server has code you want to open from your laptop, but
 nobody sits in front of it. `rune --headless` puts such a machine on the
-network with no editor at all: no window, no terminal UI, just the node
-and the workspace server its peers connect to.
+network with no editor at all: no window, no terminal UI, just the
+workspace server, which hosts the node its peers connect through.
 
 ```bash
 rune --headless
@@ -251,15 +267,16 @@ the machine shows up in `network peers` on your other machines and
 
 The same process is the machine's own workspace server: a Rune editor
 running on the machine keeps the terminals of its local workspaces
-there, so they keep running after the editor quits. Images a program
-draws in such a terminal are not kept with it: reopening the terminal
-brings back its text, and the program has to draw its images again.
-With `network.auto_join` off that is all a headless node does. There is
-no console to run `network up` in, so it says so in its log and never
-joins.
+there, so they keep running after the editor quits, and the editor's
+`network` command reads and drives the node from there. With
+`network.auto_join` off, a server an operator started serves the
+machine only; an editor on the machine can still run `network up`, and
+the server joins.
 
 Only one such server runs per data directory. When the editor finds
-none it starts one of its own, which stays off the network. A second
+none it starts one of its own, which is the same `rune --headless` and
+joins the network the same way, with the account the editor is signed
+into; it never prompts, and logs when no account is signed in. A second
 `rune --headless`, such as a service started while that one runs, exits
 with `there's another instance of Rune holding the lock` and the process
 ID of the one that holds it.
@@ -304,7 +321,7 @@ config["network"] = {
 
 | Key | Type | Default | Effect |
 | --- | --- | --- | --- |
-| `auto_join` | bool | `true` | Join the network when Rune starts. With it off, the network stays one `network up` away, with no restart needed. |
+| `auto_join` | bool | `true` | Join the network when the workspace server starts, which Rune does on startup. With it off, the network stays one `network up` away, with no restart needed. |
 | `hostname` | string | the machine's own hostname | The name this machine advertises, and the name used in its `rune://` addresses. |
 | `port` | int | `7473` | The port workspaces are served on. It is reachable only from the network, never from the machine's other interfaces. |
 
@@ -315,9 +332,14 @@ exact name to put in a `rune://` URL.
 ## How it works
 
 Rune embeds a userspace [WireGuard](https://www.wireguard.com/) node in
-its own process. There is no daemon to install, nothing runs as root,
+the machine's workspace server, the background process that also owns
+the machine's terminals; it is the `rune --headless` an operator runs,
+started on demand. There is nothing to install, nothing runs as root,
 and the rest of your system's traffic is untouched: only Rune uses the
-network.
+network. The editor talks to the node over the server's socket, and
+connections to peers go through the same server, so every window on the
+machine shares one node and the machine stays on the network while none
+is open.
 
 When a machine joins, Rune's coordination server checks your account,
 hands the machine short-lived credentials, and tells your machines about
@@ -327,9 +349,10 @@ and talk directly, encrypted end to end, and fall back to an encrypted
 relay only when no direct path can be established.
 
 Each machine serves its workspaces on port 7473 of its network address
-only. Every request carries the identity of the machine behind it, and
-Rune refuses any whose owning account is not yours, so sharing a network
-is never enough to read a machine's files or run commands on it.
+only, and the terminal attachments of those workspaces on the next port.
+Every request carries the identity of the machine behind it, and Rune
+refuses any whose owning account is not yours, so sharing a network is
+never enough to read a machine's files or run commands on it.
 
 A machine's network identity is stored in your Rune data directory,
 under `~/.rune/runenet`. `network down` leaves the network but keeps that
@@ -345,7 +368,7 @@ once open. They differ in what they need from you:
 | Addressed by | user, host, and port | machine name |
 | Reachability | the host must be reachable over SSH, so a NAT or firewall in front of it needs a forwarded port | neither machine needs to be reachable from outside; Rune traverses the NATs between them |
 | Credentials | your SSH keys and `known_hosts` | your Rune account, nothing to manage |
-| The other end runs | a workspace server that Rune starts over SSH | the Rune instance already running there |
+| The other end runs | a workspace server that Rune starts over SSH | the workspace server already running there |
 
 Use `ssh://` for machines that are not yours, or that do not run Rune.
 Use `rune://` for your own machines.
@@ -368,9 +391,10 @@ so this machine picks up the change.
 keeps working locally but is off the network. If that was a mistake, run
 `network up` to register it again, which takes a slot back.
 
-**A machine is missing from `network peers`.** Check that Rune is
-running on it, that `network status` there reports state `Running`, and
-that both machines are signed into the same account.
+**A machine is missing from `network peers`.** Check that its workspace
+server is running — it is, once Rune has been opened on it since boot —
+that `network status` there reports state `Running`, and that both
+machines are signed into the same account.
 
 **Completion after `rune://` is empty.** No other machine is online, or
 this machine is not on the network. Run `network status` to check this
@@ -391,5 +415,6 @@ account. Sign both machines into the same account.
 background. Run `network status` to see whether it succeeded, and read
 its `error` field if it did not.
 
-**Workspaces stopped working after `network down`.** Leaving the network
-disconnects open `rune://` workspaces. Run `network up` to rejoin.
+**Workspaces stopped working after `network down` or `logout`.** Leaving
+the network disconnects open `rune://` workspaces, in every Rune window
+on the machine. Run `network up` to rejoin.

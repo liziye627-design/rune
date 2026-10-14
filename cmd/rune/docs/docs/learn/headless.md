@@ -4,13 +4,15 @@ sidebar_position: 34
 
 # Headless
 
-A machine serves its workspaces on the [Rune network](./network.md) only
-while Rune runs on it. On a build box or a server nobody sits at, that
-means `rune --headless`, and the way to keep it running is to hand it to
-the machine's service manager: it starts at boot, restarts if it fails,
-and its output lands in the system log. This page is a recipe per
-service manager, and a ready-made [Docker image](#docker) for hosts that
-run containers. Read [Running a machine without the
+A machine serves its workspaces on the [Rune network](./network.md)
+while its workspace server runs. On a machine you use, Rune starts that
+server the first time you open it after boot. On a build box or a
+server nobody sits at, nothing opens Rune, so you run the server
+yourself: that is `rune --headless`, and the way to keep it running is
+to hand it to the machine's service manager: it starts at boot,
+restarts if it fails, and its output lands in the system log. This page
+is a recipe per service manager, and a ready-made [Docker image](#docker)
+for hosts that run containers. Read [Running a machine without the
 editor](./network.md#running-a-machine-without-the-editor) first if you
 have not.
 
@@ -58,7 +60,9 @@ service never asks again. Nothing needs to reach the node: it only polls
 out, so this works over SSH, in a container, or under a service manager.
 You can skip the foreground run and let the service do it on its first
 start instead: the code shows up in its log, and the node joins once you
-have entered it.
+have entered it. A machine you also use the editor on needs none of
+this: the `login` command signs in for the editor and the server alike,
+since both read the same `~/.rune`.
 
 The sign-in is a serve-only one: the node can serve your other machines
 but not reach them (see [Headless machines only
@@ -87,8 +91,9 @@ environment a package sets up, such as `GOROOT`, applies to the
 terminals and tools started after the install, with no restart.
 
 **Leave `network.auto_join` on.** It is the default. A headless node has
-no console to run `network up` in, so with it off it never joins: it
-still keeps the terminals of the editors running on the machine, but no
+no console of its own to run `network up` in, so with it off it joins
+only when an editor on the machine asks it to: it still keeps the
+terminals of the editors running on the machine, but until then no
 other machine can reach it.
 A stable name is worth setting when the host's own name is not one you
 would type, which is always the case in a container:
@@ -427,9 +432,10 @@ The [network limits](./network.md#how-many-machines-you-can-have) are
 
 ## Troubleshooting
 
-**`network.auto_join is off` in the log.** The node runs but never joins,
-so it is missing from `network peers`. Set it to `true` in the host's
-config; a headless node has no other way to join.
+**`network.auto_join is off` in the log.** The node runs but does not
+join on its own, so it is missing from `network peers`. Set it to `true`
+in the host's config; short of an editor on the machine running
+`network up`, a headless node has no other way to join.
 
 **`there's another instance of Rune holding the lock`.** Another Rune
 already serves this machine from the same data directory: a second

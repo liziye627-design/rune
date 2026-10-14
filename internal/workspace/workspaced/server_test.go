@@ -30,6 +30,9 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/term/vte"
 	"unstable.build/rune/internal/workspace"
@@ -136,6 +139,32 @@ func TestServersOfDifferentDataDirsCoexist(t *testing.T) {
 	t.Parallel()
 	start(t, workspacetest.ShortTempDir(t))
 	start(t, workspacetest.ShortTempDir(t))
+}
+
+// TestRegisterServicesSharesTheSocket pins that what the hosting
+// process registers through Options.RegisterServices is reachable on
+// the same socket as the workspace services, so a client needs one
+// connection for both.
+func TestRegisterServicesSharesTheSocket(t *testing.T) {
+	t.Parallel()
+	dataDir := workspacetest.ShortTempDir(t)
+	s, err := Start(Options{
+		DataDir: dataDir,
+		Scheme:  newScheme(t, t.TempDir()),
+		RegisterServices: func(grpcServer *grpc.Server) {
+			healthpb.RegisterHealthServer(grpcServer, health.NewServer())
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	conn, err := workspaceserver.Dial(ctx, workspaceserver.SocketPath(dataDir))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, healthpb.HealthCheckResponse_SERVING, resp.GetStatus())
 }
 
 // TestCloseReportsWhatItCouldNotRelease pins that closing a server gives

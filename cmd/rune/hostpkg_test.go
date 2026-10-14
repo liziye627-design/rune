@@ -27,37 +27,9 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/unstablebuild/blue/iterator"
 	"github.com/unstablebuild/blue/release"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"unstable.build/rune/internal/ide/idepkg"
 	"unstable.build/rune/internal/ide/idepkg/gitpkg"
 )
-
-type goPackages struct {
-	idepkg.PackageManager
-}
-
-func (goPackages) LibDir(context.Context, string) (iterator.Iterator[string], error) {
-	return iterator.FromSlice([]string{"/pkg/go/bin/go"}), nil
-}
-
-func TestServedPackagesWaitForTheEditor(t *testing.T) {
-	ctx := context.Background()
-	var s servedPackages
-
-	_, err := s.LibDir(ctx, "go")
-	assert.Equal(t, codes.Unavailable, status.Code(err),
-		"peers retry once the editor that owns the packages is up")
-
-	s.set(goPackages{})
-	it, err := s.LibDir(ctx, "go")
-	require.NoError(t, err)
-	paths, err := iterator.ToSlice(ctx, it)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"/pkg/go/bin/go"}, paths)
-}
 
 func TestHostPackageManagerInstallsPackage(t *testing.T) {
 	const pkgID = "github.com/unstablebuild/test-extension"

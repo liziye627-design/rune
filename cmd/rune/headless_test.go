@@ -43,6 +43,7 @@ import (
 	"unstable.build/rune/auth"
 	"unstable.build/rune/cmd/rune/ide/apiclient"
 	"unstable.build/rune/internal/debug"
+	"unstable.build/rune/internal/ide"
 	"unstable.build/rune/internal/runenet"
 )
 
@@ -594,4 +595,76 @@ func TestWaitForShutdown(t *testing.T) {
 			<-triggered
 		})
 	}
+}
+
+// An operator's daemon signs in by code and joins before it reports,
+// so what stdout says is what the node is doing.
+func TestStartOperatorNetwork(t *testing.T) {
+	signedInClient := func() *stubHeadlessClient {
+		return &stubHeadlessClient{
+			user: auth.RPCUser{
+				Email: "a@rune.test", Role: auth.RolePaid, ServeOnly: true,
+			},
+			signedIn: true,
+		}
+	}
+
+	t.Run("joins and prints the node's status", func(t *testing.T) {
+		api := &stubNetworkAPI{
+			user:       auth.RPCUser{Role: auth.RolePaid},
+			signedIn:   true,
+			controlURL: "https://control.example.com",
+			authKey:    "tskey-auth-secret",
+		}
+		host := newMeshHost(config.NopConfig(), t.TempDir(), newNetworkGate(api), nil)
+		t.Cleanup(func() { _ = host.Close() })
+
+		var out bytes.Buffer
+		require.NoError(t, startOperatorNetwork(
+			context.Background(), signedInClient(), host, &out))
+		assert.Contains(t, out.String(), "Signed in as a@rune.test")
+		assert.Contains(t, out.String(), "Network node")
+		assert.Equal(t, int32(1), api.credCalls.Load())
+	})
+
+	t.Run("an unentitled account does not join", func(t *testing.T) {
+		api := &stubNetworkAPI{
+			user:     auth.RPCUser{Role: auth.RoleUser},
+			signedIn: true,
+			credErr:  apiclient.ErrSubscriptionRequired,
+		}
+		host := newMeshHost(config.NopConfig(), t.TempDir(), newNetworkGate(api), nil)
+		t.Cleanup(func() { _ = host.Close() })
+
+		var out bytes.Buffer
+		err := startOperatorNetwork(context.Background(), signedInClient(), host, &out)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, runenet.ErrSubscriptionRequired), "got %v", err)
+		assert.Contains(t, err.Error(), "could not join the network")
+	})
+
+	t.Run("a failed sign-in stops before joining", func(t *testing.T) {
+		api := &stubNetworkAPI{}
+		host := newMeshHost(config.NopConfig(), t.TempDir(), newNetworkGate(api), nil)
+		t.Cleanup(func() { _ = host.Close() })
+
+		var out bytes.Buffer
+		err := startOperatorNetwork(context.Background(), &stubHeadlessClient{
+			loginErr: errors.New("oauth timed out"),
+		}, host, &out)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "login: oauth timed out")
+		assert.Zero(t, api.credCalls.Load())
+	})
+}
+
+// The server is not an editor session: its account client must not
+// report it as one, whatever the user's telemetry setting.
+func TestHeadlessAPIConfig(t *testing.T) {
+	cfg := headlessAPIConfig(config.MapConfig(map[string]any{
+		"telemetry": map[string]any{"enabled": true},
+		"editor":    map[string]any{"mode": "vim"},
+	}))
+	assert.False(t, ide.TelemetryEnabled(cfg))
+	assert.Equal(t, "vim", ide.EditorMode(cfg))
 }

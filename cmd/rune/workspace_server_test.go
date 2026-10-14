@@ -40,8 +40,19 @@ func TestWorkspaceServerCommand(t *testing.T) {
 	got := workspaceServerCommand("/data", "/data/config.yaml")
 	assert.Equal(t, []string{self, "--headless", "--daemon",
 		"--datadir", "/data", "--config", "/data/config.yaml"}, got)
+
+	// The server acts for the editor's account, so it must reach the
+	// API the editor signed in against.
+	setFlagForTest(t, flagHTTPAddress, "http://127.0.0.1:9")
+	setFlagForTest(t, flagGRPCAddress, "127.0.0.1:10")
+	got = workspaceServerCommand("/data", "/data/config.yaml")
+	assert.Equal(t, []string{self, "--headless", "--daemon",
+		"--datadir", "/data", "--config", "/data/config.yaml",
+		"--rune-http-address=http://127.0.0.1:9",
+		"--rune-grpc-address=127.0.0.1:10"}, got)
 	for _, arg := range got[1:] {
 		if name, ok := strings.CutPrefix(arg, "--"); ok {
+			name, _, _ = strings.Cut(name, "=")
 			assert.True(t, headlessFlags[name],
 				"--headless would reject the --%s it is spawned with", name)
 		}
@@ -59,7 +70,7 @@ func TestStartMachineServer(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(ws, "hello.txt"), []byte("hi"), 0o644))
 	setFlagForTest(t, flagDataPath, dataDir)
 
-	server, err := startMachineServer("")
+	server, err := startMachineServer("", nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = server.Close() })
 
@@ -73,7 +84,7 @@ func TestStartMachineServer(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), info.Size())
 
-	_, err = startMachineServer("")
+	_, err = startMachineServer("", nil)
 	require.ErrorIs(t, err, workspaceserver.ErrLocked)
 	assert.Contains(t, err.Error(), "there's another instance of Rune holding the lock")
 }

@@ -151,7 +151,8 @@ func newBootstrapHandler(
 
 	if isBootstrapped(dataDir) {
 		client, releaseManager := newAPIClient(bh.storage, installBackupDir, rootCfg)
-		bh.network = newNetwork(rootCfg, dataDir, shellRCDir, newNetworkGate(client))
+		bh.network = newNetwork(rootCfg, dataDir, newNetworkGate(client),
+			workspaceServerCommand(dataDir, configPath))
 		bh.network.startAutoJoin()
 		realIDE, err := bh.buildConfiguredIDE(client, releaseManager, false)
 		if err != nil {
@@ -505,7 +506,7 @@ func (b *bootstrapHandler) setupConfiguredIDE(
 	scheduleCrashReportCheck(i, client, b.dataDir, b.scheduleNextTick)
 
 	var errs []error
-	if err := subscribeCommands(b.g, client, i,
+	if err := subscribeCommands(b.g, client, b.network, i,
 		b.transparentWindow, b.configPath, b.launchCmd); err != nil {
 		errs = append(errs, fmt.Errorf("subscribe to GUI commands: %w", err))
 	}
@@ -619,7 +620,8 @@ func (b *bootstrapHandler) performSwap() error {
 	client, releaseManager := newAPIClient(b.storage, b.installBackupDir, rootCfg)
 	// The network gates on the account, so it exists only from the
 	// moment the API client that vouches for it does.
-	b.network = newNetwork(b.rootCfg, b.dataDir, b.shellRCDir, newNetworkGate(client))
+	b.network = newNetwork(b.rootCfg, b.dataDir, newNetworkGate(client),
+		workspaceServerCommand(b.dataDir, b.configPath))
 	b.network.startAutoJoin()
 	realIDE, err := b.buildConfiguredIDE(client, releaseManager, true)
 	if err != nil {

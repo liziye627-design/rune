@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,6 +29,7 @@ import (
 	"unstable.build/rune/cmd/rune/ide/apiclient"
 	"unstable.build/rune/internal/ide"
 	"unstable.build/rune/internal/runenet"
+	"unstable.build/rune/internal/workspace/workspaceserver"
 )
 
 type stubNetworkAPI struct {
@@ -37,7 +39,7 @@ type stubNetworkAPI struct {
 	controlURL string
 	authKey    string
 	credErr    error
-	credCalls  int
+	credCalls  atomic.Int32
 	machines   []apiclient.Machine
 	machineErr error
 	removed    []string
@@ -49,7 +51,7 @@ func (s *stubNetworkAPI) AccountStatus(context.Context) (auth.RPCUser, bool, err
 }
 
 func (s *stubNetworkAPI) NetworkCredentials(context.Context) (string, string, error) {
-	s.credCalls++
+	s.credCalls.Add(1)
 	return s.controlURL, s.authKey, s.credErr
 }
 
@@ -70,43 +72,42 @@ func (s *stubNetworkAPI) NetworkMachineRemove(_ context.Context, id string) erro
 func TestNetworkGateCheck(t *testing.T) {
 	tsuite := []struct {
 		name string
-		api  stubNetworkAPI
+		api  *stubNetworkAPI
 		want error
 	}{
-		{"signed out", stubNetworkAPI{}, runenet.ErrNotAuthenticated},
+		{"signed out", &stubNetworkAPI{}, runenet.ErrNotAuthenticated},
 		{
 			"undecodable token",
-			stubNetworkAPI{statusErr: errors.New("bad jwt")},
+			&stubNetworkAPI{statusErr: errors.New("bad jwt")},
 			runenet.ErrNotAuthenticated,
 		},
 		{
 			// The free plan carries the network too; how many
 			// machines it covers is the server's call at mint time.
 			"never subscribed",
-			stubNetworkAPI{user: auth.RPCUser{Role: auth.RoleUser}, signedIn: true},
+			&stubNetworkAPI{user: auth.RPCUser{Role: auth.RoleUser}, signedIn: true},
 			nil,
 		},
 		{
 			"paid",
-			stubNetworkAPI{user: auth.RPCUser{Role: auth.RolePaid}, signedIn: true},
+			&stubNetworkAPI{user: auth.RPCUser{Role: auth.RolePaid}, signedIn: true},
 			nil,
 		},
 		{
 			"one-off purchase",
-			stubNetworkAPI{user: auth.RPCUser{Role: auth.RoleOneOff}, signedIn: true},
+			&stubNetworkAPI{user: auth.RPCUser{Role: auth.RoleOneOff}, signedIn: true},
 			nil,
 		},
 		{
 			"admin",
-			stubNetworkAPI{user: auth.RPCUser{Role: auth.RoleAdmin}, signedIn: true},
+			&stubNetworkAPI{user: auth.RPCUser{Role: auth.RoleAdmin}, signedIn: true},
 			nil,
 		},
 	}
 
 	for _, tcase := range tsuite {
 		t.Run(tcase.name, func(t *testing.T) {
-			api := tcase.api
-			gate := newNetworkGate(&api)
+			gate := newNetworkGate(tcase.api)
 			err := gate.check(context.Background())
 			if tcase.want == nil {
 				assert.NoError(t, err)
@@ -139,7 +140,7 @@ func TestNetworkGateCredentials(t *testing.T) {
 		}
 		_, _, err := newNetworkGate(api).credentials(context.Background())
 		assert.True(t, errors.Is(err, runenet.ErrNotAuthenticated), "got %v", err)
-		assert.Zero(t, api.credCalls)
+		assert.Zero(t, api.credCalls.Load())
 	})
 
 	t.Run("maps the API entitlement errors", func(t *testing.T) {
@@ -266,61 +267,10 @@ func TestMachineRemoved(t *testing.T) {
 	}
 }
 
-func TestNetworkHandleNeedsLogin(t *testing.T) {
-	setup := func(t *testing.T, api *stubNetworkAPI) (
-		*network, *networkPrompter, *int,
-	) {
-		t.Helper()
-		net := newNetwork(config.NopConfig(), t.TempDir(), "", newNetworkGate(api))
-		t.Cleanup(func() { _ = net.Close() })
-		prompts := 0
-		return net, &networkPrompter{
-			scheduleNextTick: func(func()) bool { prompts++; return true },
-		}, &prompts
-	}
-
-	t.Run("prompts when the account no longer lists it", func(t *testing.T) {
-		api := &stubNetworkAPI{
-			user:     auth.RPCUser{Role: auth.RoleUser},
-			signedIn: true,
-			machines: []apiclient.Machine{{ID: "1", Hostname: "laptop"}},
-		}
-		net, prompter, prompts := setup(t, api)
-		net.handleNeedsLogin(context.Background(), prompter, "9")
-		assert.Equal(t, 1, *prompts)
-		assert.Zero(t, api.credCalls)
-	})
-
-	t.Run("re-registers silently when it is still listed", func(t *testing.T) {
-		api := &stubNetworkAPI{
-			user:     auth.RPCUser{Role: auth.RoleUser},
-			signedIn: true,
-			machines: []apiclient.Machine{{ID: "1", Hostname: "laptop"}},
-			credErr:  errors.New("credentials endpoint unreachable"),
-		}
-		net, prompter, prompts := setup(t, api)
-		net.handleNeedsLogin(context.Background(), prompter, "1")
-		assert.Zero(t, *prompts)
-		assert.Equal(t, 1, api.credCalls)
-	})
-
-	t.Run("says nothing when the account cannot be reached", func(t *testing.T) {
-		api := &stubNetworkAPI{
-			user:       auth.RPCUser{Role: auth.RoleUser},
-			signedIn:   true,
-			machineErr: errors.New("account server unreachable"),
-		}
-		net, prompter, prompts := setup(t, api)
-		net.handleNeedsLogin(context.Background(), prompter, "1")
-		assert.Zero(t, *prompts)
-		assert.Zero(t, api.credCalls)
-	})
-}
-
 func TestGatedNetworkMachineNames(t *testing.T) {
 	newGated := func(t *testing.T, api *stubNetworkAPI) (gatedNetwork, *int) {
 		t.Helper()
-		net := newNetwork(config.NopConfig(), t.TempDir(), "", newNetworkGate(api))
+		net := newNetwork(config.NopConfig(), t.TempDir(), newNetworkGate(api), nil)
 		t.Cleanup(func() { _ = net.Close() })
 		prompts := 0
 		return gatedNetwork{n: net, prompter: &networkPrompter{
@@ -363,7 +313,10 @@ func TestGatedNetworkMachineNames(t *testing.T) {
 func TestNetworkNilDependenciesPanic(t *testing.T) {
 	assert.Panics(t, func() { newNetworkGate(nil) })
 	assert.Panics(t, func() {
-		newNetwork(config.NopConfig(), t.TempDir(), "", nil)
+		newNetwork(config.NopConfig(), t.TempDir(), nil, nil)
+	})
+	assert.Panics(t, func() {
+		newMeshHost(config.NopConfig(), t.TempDir(), nil, nil)
 	})
 	assert.Panics(t, func() {
 		newNetworkPrompter(nil, func(func()) bool { return true })
@@ -386,12 +339,20 @@ func TestNewNetworkAlwaysAssembles(t *testing.T) {
 	}
 	for _, tcase := range tsuite {
 		t.Run(tcase.name, func(t *testing.T) {
-			net := newNetwork(config.MapConfig(tcase.cfg), t.TempDir(), "",
-				newNetworkGate(&stubNetworkAPI{}))
+			dataDir := t.TempDir()
+			net := newNetwork(config.MapConfig(tcase.cfg), dataDir,
+				newNetworkGate(&stubNetworkAPI{}), nil)
 			t.Cleanup(func() { _ = net.Close() })
-			require.NotNil(t, net.node)
 			require.NotNil(t, net.gate)
+			assert.Equal(t, workspaceserver.NetSocketPath(dataDir), net.dialer.Socket)
 			assert.False(t, net.autoJoin)
+
+			host := newMeshHost(config.MapConfig(tcase.cfg), dataDir,
+				newNetworkGate(&stubNetworkAPI{}), nil)
+			t.Cleanup(func() { _ = host.Close() })
+			require.NotNil(t, host.node)
+			require.NotNil(t, host.server)
+			assert.False(t, host.autoJoin)
 		})
 	}
 }

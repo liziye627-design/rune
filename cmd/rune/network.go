@@ -21,8 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"os/user"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -31,22 +30,32 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/status"
+	"unstable.build/rune/cmd/rune/ide/apiclient"
+	"unstable.build/rune/cmd/rune/loginshell"
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/ide"
 	"unstable.build/rune/internal/ide/console/networkconsole"
-	"unstable.build/rune/internal/ide/idepkg/pkgrpc"
 	"unstable.build/rune/internal/runenet"
-	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/runenet/meshdial"
+	"unstable.build/rune/internal/runenet/meshrpc"
 	"unstable.build/rune/internal/workspace/workspacerune"
+	"unstable.build/rune/internal/workspace/workspaceserver"
 )
 
-// network holds the process-wide mesh node and the workspace server it
-// exposes to peers. The stack is always fully assembled, whatever the
-// configuration says: `network.auto_join` only decides whether boot
-// joins the mesh, so the `network up` console command works later
-// without a restart.
+// network is the editor's side of the machine's network node, which
+// the workspace server hosts so the machine stays on the network while
+// no editor window is open. The editor drives the node over the
+// server's socket and reaches peers through the server's mesh socket;
+// the entitlement check, the account's machine list and every prompt
+// stay here, on the editor's own account client.
+//
+// The connection to the server is made on first use and starting the
+// server is part of making it, so a boot with `network.auto_join` on
+// puts the machine on the network before any terminal is opened.
 type network struct {
-	node *runenet.Node
 	gate *networkGate
 	// gated is false only when the node joins with credentials it was
 	// given directly, which is a debug-build escape hatch: that mesh
@@ -55,101 +64,316 @@ type network struct {
 	gated    bool
 	autoJoin bool
 	dataDir  string
-	// shellRCDir holds the dotfiles for peers' login shells; see
-	// workspace.NewFileSchemeFunc.
-	shellRCDir string
-	// packages is this machine's package manager as served to peers.
-	packages servedPackages
+	// command starts the workspace server when none is running. Only
+	// rune knows it is rune, so a host that merely embeds the IDE
+	// leaves it empty and reaches a running server only.
+	command []string
+	dialer  meshdial.Dialer
+	// connectServer is [workspaceserver.Connect]; tests stand in for it.
+	connectServer func(context.Context, workspaceserver.Config) (*grpc.ClientConn, error)
 
 	mu     sync.Mutex
-	server *runenet.WorkspaceServer
+	conn   *grpc.ClientConn
+	client *meshrpc.Client
 	closed bool
-	// prompter is only there once the IDE exists, which is after the
-	// node may already have started; a push that lands before then
-	// has nowhere to be shown.
+	// connecting is closed once the connection being made settles. It
+	// is made without mu held: it may start the server and wait for it
+	// to serve, and nothing else may wait behind that.
+	connecting chan struct{}
+	// prompter is only there once the IDE exists; a push that lands
+	// before then has nowhere to be shown.
 	prompter *networkPrompter
+
+	watchCtx    context.Context
+	cancelWatch context.CancelFunc
 }
 
-// newNetwork assembles the mesh node and its entitlement gate. A
+// newNetwork assembles the editor's view of the network. command is
+// what starts the workspace server; see [workspaceServerCommand]. A
 // malformed `network` config section falls back to defaults with a
 // logged error rather than crippling the stack: config validation is
 // the user's mistake to surface, not a reason to run partially
 // constructed.
 func newNetwork(
-	rootCfg config.Config, dataDir, shellRCDir string, gate *networkGate,
+	rootCfg config.Config, dataDir string, gate *networkGate, command []string,
 ) *network {
 	if gate == nil {
 		panic("newNetwork: gate must not be nil")
 	}
-	cfg, err := networkConfig(rootCfg, dataDir)
-	if err != nil {
-		log.Errorf("network: %v (using defaults)", err)
-		cfg, _ = runenet.FromConfig(config.NopConfig(), dataDir)
-	}
+	cfg := networkConfigOrDefaults(rootCfg, dataDir)
 	ret := &network{
-		gate:       gate,
-		autoJoin:   cfg.AutoJoin,
-		dataDir:    dataDir,
-		shellRCDir: shellRCDir,
+		gate:          gate,
+		autoJoin:      cfg.AutoJoin,
+		dataDir:       dataDir,
+		command:       command,
+		dialer:        meshdial.Dialer{Socket: workspaceserver.NetSocketPath(dataDir)},
+		connectServer: workspaceserver.Connect,
 		// A key configured out of band belongs to a debug build
 		// driving a coordination server of its own, which the paid
 		// mesh must not be mixed up with.
 		gated: cfg.AuthKey == "",
 	}
-	if ret.gated {
-		cfg.Credentials = gate.credentials
-		cfg.OnNeedsLogin = ret.onNeedsLogin
-	}
-	ret.node = runenet.New(cfg)
+	ret.watchCtx, ret.cancelWatch = context.WithCancel(context.Background())
 	return ret
 }
 
-// needsLoginTimeout bounds the account round-trip a logout triggers.
-const needsLoginTimeout = 30 * time.Second
+// networkConfigOrDefaults is [networkConfig], falling back to the
+// defaults with a logged error.
+func networkConfigOrDefaults(rootCfg config.Config, dataDir string) runenet.Config {
+	cfg, err := networkConfig(rootCfg, dataDir)
+	if err != nil {
+		log.Errorf("network: %v (using defaults)", err)
+		cfg, _ = runenet.FromConfig(config.NopConfig(), dataDir)
+	}
+	return cfg
+}
 
-// onNeedsLogin runs when the coordination server stops accepting this
-// machine's node key. Two very different things look like that from
-// here and only the account's machine list tells them apart: a node
-// key that reached the end of its lifetime, which is re-minted without
-// bothering anyone, and a machine the account removed on purpose,
-// which the user has to be told about.
-func (n *network) onNeedsLogin() {
-	prompter := n.currentPrompter()
-	if prompter == nil {
+func networkConfig(rootCfg config.Config, dataDir string) (runenet.Config, error) {
+	cfg, err := rootCfg.GetConfig("network")
+	if errors.Is(err, config.ErrNotFound) {
+		cfg = config.NopConfig()
+	} else if err != nil {
+		return runenet.Config{}, fmt.Errorf("get 'network' section from config: %w", err)
+	}
+	return runenet.FromConfig(cfg, dataDir)
+}
+
+var errNetworkClosed = errors.New("network: editor is shutting down")
+
+// connect returns the client of the workspace server, starting the
+// server when none is running. A connection the server went away from
+// is dropped so the next call starts a replacement rather than waiting
+// on a socket nobody serves.
+func (n *network) connect(ctx context.Context) (*meshrpc.Client, error) {
+	return n.clientFor(ctx, true)
+}
+
+// running returns the client of a workspace server already running,
+// and fails fast when there is none: the caller only wants to hear
+// from a server, not to start one.
+func (n *network) running(ctx context.Context) (*meshrpc.Client, error) {
+	return n.clientFor(ctx, false)
+}
+
+func (n *network) clientFor(ctx context.Context, start bool) (*meshrpc.Client, error) {
+	for {
+		n.mu.Lock()
+		if n.closed {
+			n.mu.Unlock()
+			return nil, errNetworkClosed
+		}
+		if n.conn != nil && n.conn.GetState() != connectivity.TransientFailure {
+			client := n.client
+			n.mu.Unlock()
+			return client, nil
+		}
+		if n.conn != nil {
+			_ = n.conn.Close()
+			n.conn, n.client = nil, nil
+		}
+		wait := n.connecting
+		if wait == nil {
+			n.connecting = make(chan struct{})
+		}
+		n.mu.Unlock()
+		if wait == nil {
+			return n.connectOnce(ctx, start)
+		}
+		// The connection being made may not start a server, or may
+		// fail for its caller's reasons, so this caller looks again.
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// connectOnce makes the connection clientFor found missing, and owns
+// n.connecting until it settles.
+func (n *network) connectOnce(ctx context.Context, start bool) (*meshrpc.Client, error) {
+	cfg := workspaceserver.Config{Socket: workspaceserver.SocketPath(n.dataDir)}
+	if start && len(n.command) > 0 {
+		cfg.Command = func(string) (*exec.Cmd, error) {
+			return exec.Command(n.command[0], n.command[1:]...), nil
+		}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// Quitting the editor abandons a connection still being made.
+	defer context.AfterFunc(n.watchCtx, cancel)()
+	conn, err := n.connectServer(ctx, cfg)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	close(n.connecting)
+	n.connecting = nil
+	if n.closed {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, errNetworkClosed
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reach workspace server: %w", err)
+	}
+	n.conn = conn
+	n.client = meshrpc.NewClient(conn)
+	return n.client, nil
+}
+
+// dropIfGone forgets the connection when err says the server is not
+// there to answer, so the next use starts one.
+func (n *network) dropIfGone(err error) {
+	if status.Code(err) != codes.Unavailable {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.conn != nil {
+		_ = n.conn.Close()
+		n.conn, n.client = nil, nil
+	}
+}
+
+// startAutoJoin puts the machine on the network off the boot path when
+// the user asked for it. The workspace server joins on its own when it
+// starts; asking again covers a server that is already running and
+// could not join the last time. Failures stay out of the UI on
+// purpose: a signed-out or unentitled account simply does not join,
+// and the prompt comes when the user asks for the network explicitly.
+func (n *network) startAutoJoin() {
+	autoJoin(n.autoJoin, n.join)
+}
+
+// autoJoin runs join in the background when enabled. A signed-out or
+// unentitled account is logged as not joining rather than as a
+// failure.
+func autoJoin(enabled bool, join func(context.Context) error) {
+	if !enabled {
 		return
 	}
 	go debug.CapturePanicReport(func() {
-		ctx, cancel := context.WithTimeout(
-			context.Background(), needsLoginTimeout)
-		defer cancel()
-		st, err := n.node.Status(ctx)
-		if err != nil || st.MachineID == "" {
-			// A machine that never registered has no removal to
-			// report and no key worth re-minting.
-			return
+		if err := join(context.Background()); err != nil {
+			if errors.Is(err, runenet.ErrNotAuthenticated) ||
+				errors.Is(err, runenet.ErrSubscriptionRequired) {
+				log.Infof("network: not joining: %v", err)
+			} else {
+				log.Errorf("could not join network: %v", err)
+			}
 		}
-		n.handleNeedsLogin(ctx, prompter, st.MachineID)
 	})
 }
 
-func (n *network) handleNeedsLogin(
-	ctx context.Context, prompter *networkPrompter, machineID string,
-) {
-	machines, err := n.gate.machines(ctx)
+// join asks the workspace server to bring the node online, starting
+// the server first if needed. It is idempotent, so a machine that could
+// not join at startup joins on the first `network up` or rune:// open
+// that follows. An account the plan does not cover is turned away
+// before a server is started on its behalf: the server could not join
+// either, and the prompt that fixes it belongs to whoever asked.
+func (n *network) join(ctx context.Context) error {
+	if err := n.check(ctx); err != nil {
+		return err
+	}
+	client, err := n.connect(ctx)
 	if err != nil {
-		// Without the list the two cases are indistinguishable, and
-		// claiming the machine was removed when the account server is
-		// merely unreachable would be worse than saying nothing.
-		log.Warnf("network: could not check this machine's registration: %v", err)
-		return
+		return err
 	}
-	if machineRemoved(machineID, machines) {
-		prompter.prompt(runenet.ErrMachineRemoved)
-		return
+	err = client.Join(ctx)
+	n.dropIfGone(err)
+	return err
+}
+
+// joinAsync joins the mesh off the event loop. Failures are logged
+// rather than reported: the caller's reconnect loop is what tells the
+// user whether the peer became reachable.
+func (n *network) joinAsync() {
+	go debug.CapturePanicReport(func() {
+		if err := n.join(context.Background()); err != nil {
+			log.Warnf("could not join network: %v", err)
+		}
+	})
+}
+
+// downTimeout bounds taking the node offline on logout.
+const downTimeout = 10 * time.Second
+
+// down takes the machine off the network. A server that is not running
+// has no node to take down.
+func (n *network) down(ctx context.Context) error {
+	client, err := n.running(ctx)
+	if err != nil {
+		return nil
 	}
-	if err := n.node.Up(ctx); err != nil {
-		log.Warnf("could not re-register machine on the network: %v", err)
+	err = client.Down(ctx)
+	n.dropIfGone(err)
+	if errors.Is(err, runenet.ErrNotStarted) {
+		return nil
 	}
+	return err
+}
+
+// loggedIn is what a successful `login` triggers: a machine the user
+// wants on the network joins with the account they just signed into.
+func (n *network) loggedIn() {
+	if n.autoJoin {
+		n.joinAsync()
+	}
+}
+
+// loggedOut is what a successful `logout` triggers. The node holds
+// credentials minted for the account that just signed out, so it
+// leaves the network rather than keep acting for it.
+func (n *network) loggedOut(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, downTimeout)
+	defer cancel()
+	if err := n.down(ctx); err != nil {
+		log.Warnf("network: could not leave the network on logout: %v", err)
+	}
+}
+
+// loginClient wraps the account client the `login` and `logout`
+// commands run on, so the network reacts to both.
+func (n *network) loginClient(client loginshell.Client) loginshell.Client {
+	return networkLoginClient{Client: client, n: n}
+}
+
+type networkLoginClient struct {
+	loginshell.Client
+	n *network
+}
+
+func (c networkLoginClient) Login(ctx context.Context) apiclient.LoginSession {
+	session := c.Client.Login(ctx)
+	done := make(chan error, 1)
+	go debug.CapturePanicReport(func() {
+		defer close(done)
+		err, ok := <-session.Done
+		if !ok {
+			return
+		}
+		if err == nil {
+			c.n.loggedIn()
+		}
+		done <- err
+	})
+	return apiclient.LoginSession{URL: session.URL, Done: done}
+}
+
+func (c networkLoginClient) Logout(ctx context.Context) error {
+	if err := c.Client.Logout(ctx); err != nil {
+		return err
+	}
+	c.n.loggedOut(ctx)
+	return nil
+}
+
+// check reports whether this account may use the network.
+func (n *network) check(ctx context.Context) error {
+	if !n.gated {
+		return nil
+	}
+	return n.gate.check(ctx)
 }
 
 func (n *network) setPrompter(prompter *networkPrompter) {
@@ -164,99 +388,6 @@ func (n *network) currentPrompter() *networkPrompter {
 	return n.prompter
 }
 
-// startAutoJoin joins the mesh off the boot path when the user asked
-// for it. Failures stay out of the UI on purpose: a signed-out or
-// unentitled account simply does not join, and the prompt comes when
-// the user asks for the network explicitly.
-func (n *network) startAutoJoin() {
-	if !n.autoJoin {
-		return
-	}
-	go debug.CapturePanicReport(func() {
-		if err := n.join(context.Background()); err != nil {
-			if errors.Is(err, runenet.ErrNotAuthenticated) ||
-				errors.Is(err, runenet.ErrSubscriptionRequired) {
-				log.Infof("network: not joining: %v", err)
-			} else {
-				log.Errorf("could not join network: %v", err)
-			}
-		}
-	})
-}
-
-// join brings the node online and serves this machine's workspaces to
-// its peers. It is idempotent, so a machine that could not join at
-// startup joins on the first `network up` or rune:// open that follows.
-func (n *network) join(ctx context.Context) error {
-	if err := n.node.Start(ctx); err != nil {
-		return err
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.closed || n.server != nil {
-		return nil
-	}
-	server, err := serveNetworkWorkspaces(n.node, n.dataDir, n.shellRCDir,
-		runenet.WithServices(func(r grpc.ServiceRegistrar) {
-			pkgrpc.NewServer(&n.packages).Register(r)
-		}))
-	if err != nil {
-		return fmt.Errorf("could not serve workspaces on the network: %w", err)
-	}
-	n.server = server
-	return nil
-}
-
-// check reports whether this account may use the network.
-func (n *network) check(ctx context.Context) error {
-	if !n.gated {
-		return nil
-	}
-	return n.gate.check(ctx)
-}
-
-func networkConfig(rootCfg config.Config, dataDir string) (runenet.Config, error) {
-	cfg, err := rootCfg.GetConfig("network")
-	if errors.Is(err, config.ErrNotFound) {
-		cfg = config.NopConfig()
-	} else if err != nil {
-		return runenet.Config{}, fmt.Errorf("get 'network' section from config: %w", err)
-	}
-	return runenet.FromConfig(cfg, dataDir)
-}
-
-// serveNetworkWorkspaces exposes the whole filesystem to peers, rooted
-// at "/", so a rune:// URI can name any path the user could open
-// locally. Only machines owned by the same account get that far; see
-// runenet.PeerAuthorizer.
-//
-// dataDir is advertised to peers as this instance's install root, so
-// it is resolved to an absolute path here: the peer consumes it as a
-// path on this host, not relative to its own process.
-func serveNetworkWorkspaces(
-	node *runenet.Node, dataDir, shellRCDir string, opts ...runenet.ServeOption,
-) (*runenet.WorkspaceServer, error) {
-	uri, err := workspaceapi.CurrentUserHostURI("/")
-	if err != nil {
-		return nil, fmt.Errorf("root workspace URI: %w", err)
-	}
-	dataDir, err = workspaceapi.ExpandPath(dataDir, user.Current, os.Getwd)
-	if err != nil {
-		return nil, fmt.Errorf("resolve data dir %s: %w", dataDir, err)
-	}
-	scheme, err := workspace.NewFileSchemeFunc(dataDir, shellRCDir)(
-		context.Background(), config.NopConfig(), uri)
-	if err != nil {
-		return nil, fmt.Errorf("root workspace scheme: %w", err)
-	}
-	server, err := runenet.ServeWorkspace(node, scheme, dataDir, opts...)
-	if err != nil {
-		_ = scheme.Close()
-		return nil, err
-	}
-	return server, nil
-}
-
 // completerOption feeds mesh peers and their directories to
 // `workspaceopen` completion. The completer deliberately never
 // prompts — a completion runs on a keystroke, and a keystroke must not
@@ -268,15 +399,14 @@ func (n *network) completerOption() ide.Option {
 }
 
 // register wires the network into a live IDE: the rune:// workspace
-// scheme, the `network` console command and the IDE's package manager,
-// which peers install through. The first two prompt the user to sign
+// scheme, the `network` console command and the watch that shows what
+// the workspace server reports. The first two prompt the user to sign
 // in or upgrade when the plan does not cover the network, which is why
 // they are registered here rather than at IDE construction — the
 // prompter cannot exist before the IDE does.
 func (n *network) register(
 	i *ide.IDE, scheduleNextTick func(func()) bool,
 ) error {
-	n.packages.set(i.PackageManager())
 	prompter := newNetworkPrompter(i, scheduleNextTick)
 	n.setPrompter(prompter)
 	if err := i.RegisterScheme(
@@ -291,7 +421,54 @@ func (n *network) register(
 	if err := i.RegisterREPLCommand(networkconsole.Manual(), h); err != nil {
 		return fmt.Errorf("register '%s': %w", networkconsole.CommandName, err)
 	}
+	go debug.CapturePanicReport(n.watch)
 	return nil
+}
+
+// watchRetryDelay is how long the watch waits before looking for the
+// workspace server again after losing it, or finding none.
+const watchRetryDelay = 5 * time.Second
+
+// watch follows the workspace server's view of the node for as long as
+// the editor runs, and shows the removal prompt when the account no
+// longer lists this machine. It only listens to a server that is
+// running: with `network.auto_join` off, nothing here starts one. A
+// stream that ends — the server restarted, or was not there yet — is
+// resubscribed after a pause.
+func (n *network) watch() {
+	ctx := n.watchCtx
+	shown := false
+	for ctx.Err() == nil {
+		if events, err := n.subscribe(ctx); err == nil {
+			for ev := range events {
+				if !ev.MachineRemoved {
+					shown = false
+					continue
+				}
+				if shown {
+					continue
+				}
+				shown = true
+				if prompter := n.currentPrompter(); prompter != nil {
+					prompter.prompt(runenet.ErrMachineRemoved)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(watchRetryDelay):
+		}
+	}
+}
+
+func (n *network) subscribe(ctx context.Context) (<-chan meshrpc.Change, error) {
+	client, err := n.running(ctx)
+	if err != nil {
+		return nil, err
+	}
+	events, err := client.Watch(ctx)
+	n.dropIfGone(err)
+	return events, err
 }
 
 // schemeFunc gates rune:// workspaces on the account's plan. The check
@@ -299,7 +476,7 @@ func (n *network) register(
 // loop; a machine that has not joined yet does so in the background
 // while the scheme's reconnect loop waits for it.
 func (n *network) schemeFunc(prompter *networkPrompter) schemeapi.SchemeFunc {
-	inner := workspacerune.New(n.node)
+	inner := workspacerune.New(gatedMesh{n})
 	return func(
 		ctx context.Context, cfg config.Config, uri workspaceapi.URI,
 	) (schemeapi.Scheme, error) {
@@ -312,20 +489,10 @@ func (n *network) schemeFunc(prompter *networkPrompter) schemeapi.SchemeFunc {
 	}
 }
 
-// joinAsync joins the mesh off the event loop. Failures are logged
-// rather than reported: the caller's reconnect loop is what tells the
-// user whether the peer became reachable.
-func (n *network) joinAsync() {
-	go debug.CapturePanicReport(func() {
-		if err := n.join(context.Background()); err != nil {
-			log.Warnf("could not join network: %v", err)
-		}
-	})
-}
-
 // gatedMesh hides the mesh from an account whose plan does not cover
 // the network: a completion runs on a keystroke, and a keystroke must
-// not open a modal.
+// not open a modal. Dials go through the workspace server's mesh
+// socket, starting the server when none is running.
 type gatedMesh struct {
 	n *network
 }
@@ -334,24 +501,36 @@ func (g gatedMesh) Peers(ctx context.Context) ([]runenet.Peer, error) {
 	if err := g.n.check(ctx); err != nil {
 		return nil, nil
 	}
-	return g.n.node.Peers(ctx)
+	client, err := g.n.running(ctx)
+	if err != nil {
+		return nil, nil
+	}
+	peers, err := client.Peers(ctx)
+	g.n.dropIfGone(err)
+	return peers, err
 }
 
 func (g gatedMesh) Dial(ctx context.Context, peer string) (net.Conn, error) {
 	if err := g.n.check(ctx); err != nil {
 		return nil, err
 	}
-	return g.n.node.Dial(ctx, peer)
+	if _, err := g.n.connect(ctx); err != nil {
+		return nil, err
+	}
+	return g.n.dialer.Dial(ctx, peer)
 }
 
 func (g gatedMesh) DialAttachment(ctx context.Context, peer string) (net.Conn, error) {
 	if err := g.n.check(ctx); err != nil {
 		return nil, err
 	}
-	return g.n.node.DialAttachment(ctx, peer)
+	if _, err := g.n.connect(ctx); err != nil {
+		return nil, err
+	}
+	return g.n.dialer.DialAttachment(ctx, peer)
 }
 
-// gatedNetwork is what the `network` command operates on: the two
+// gatedNetwork is what the `network` command operates on: the
 // subcommands that need the mesh check the plan first, so a user
 // without one is told how to get it instead of being told the node is
 // not running.
@@ -365,7 +544,12 @@ func (g gatedNetwork) Status(ctx context.Context) (runenet.Status, error) {
 		g.prompter.prompt(err)
 		return runenet.Status{}, err
 	}
-	st, err := g.n.node.Status(ctx)
+	client, err := g.n.connect(ctx)
+	if err != nil {
+		return runenet.Status{}, err
+	}
+	st, err := client.Status(ctx)
+	g.n.dropIfGone(err)
 	if err != nil {
 		return runenet.Status{}, err
 	}
@@ -397,8 +581,12 @@ func (g gatedNetwork) removed(ctx context.Context, st runenet.Status) bool {
 const joinWaitTimeout = 30 * time.Second
 
 func (g gatedNetwork) Up(ctx context.Context) error {
-	if err := g.n.join(ctx); err != nil {
+	if err := g.n.check(ctx); err != nil {
 		g.prompter.prompt(err)
+		return err
+	}
+	client, err := g.n.connect(ctx)
+	if err != nil {
 		return err
 	}
 	upCtx, cancel := context.WithTimeout(ctx, joinWaitTimeout)
@@ -407,29 +595,44 @@ func (g gatedNetwork) Up(ctx context.Context) error {
 	// so it has to work for the machine that slept through its own
 	// removal: that node is Running on a netmap nobody else has, and
 	// only an unconditional re-registration gets it back.
-	if st, err := g.n.node.Status(upCtx); err == nil && g.removed(upCtx, st) {
-		if err := g.n.node.Rejoin(upCtx); err != nil {
+	if st, err := client.Status(upCtx); err == nil && g.removed(upCtx, st) {
+		if err := client.Rejoin(upCtx); err != nil {
 			g.prompter.prompt(err)
 			return err
 		}
 		return nil
 	}
-	if err := g.n.node.Up(upCtx); err != nil {
+	err = client.Up(upCtx)
+	g.n.dropIfGone(err)
+	if err != nil {
 		if upCtx.Err() != nil && ctx.Err() == nil {
 			return fmt.Errorf("not a member after %s; joining continues "+
 				"in the background — run `network status`", joinWaitTimeout)
 		}
+		g.prompter.prompt(err)
 		return err
 	}
 	return nil
 }
 
 func (g gatedNetwork) Peers(ctx context.Context) ([]runenet.Peer, error) {
-	return g.n.node.Peers(ctx)
+	client, err := g.n.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	peers, err := client.Peers(ctx)
+	g.n.dropIfGone(err)
+	return peers, err
 }
 
 func (g gatedNetwork) Down(ctx context.Context) error {
-	return g.n.node.Down(ctx)
+	client, err := g.n.connect(ctx)
+	if err != nil {
+		return err
+	}
+	err = client.Down(ctx)
+	g.n.dropIfGone(err)
+	return err
 }
 
 // Machines and Remove go to the account server rather than the mesh:
@@ -478,7 +681,9 @@ func (g gatedNetwork) MachineNames(ctx context.Context) ([]string, error) {
 	return ret, nil
 }
 
-// Close leaves the mesh and stops serving workspaces to peers.
+// Close drops the connection to the workspace server. The node keeps
+// running there: the machine stays on the network after the editor
+// quits.
 func (n *network) Close() error {
 	n.mu.Lock()
 	if n.closed {
@@ -486,16 +691,13 @@ func (n *network) Close() error {
 		return nil
 	}
 	n.closed = true
-	server := n.server
-	n.server = nil
+	conn := n.conn
+	n.conn, n.client = nil, nil
 	n.mu.Unlock()
 
-	var errs []error
-	if server != nil {
-		errs = append(errs, server.Close())
+	n.cancelWatch()
+	if conn != nil {
+		return conn.Close()
 	}
-	// The node outlives Close so a rune:// open racing shutdown reads
-	// a closed node rather than a nil one.
-	errs = append(errs, n.node.Close())
-	return errors.Join(errs...)
+	return nil
 }

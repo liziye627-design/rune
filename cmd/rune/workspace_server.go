@@ -58,11 +58,23 @@ func runeExecutable() string {
 // demand. It is the same `rune --headless` an operator runs, told it
 // was spawned so that losing the start race to another server is not
 // an error: whoever spawned it connects to the winner.
+//
+// The server joins the network for the editor's account, so it is
+// pointed at the Rune API this process was pointed at.
 func workspaceServerCommand(dataDir, configPath string) []string {
-	return []string{
+	ret := []string{
 		runeExecutable(), "--headless", "--daemon",
 		"--datadir", dataDir, "--config", configPath,
 	}
+	for _, name := range []string{
+		"rune-http-address", "rune-grpc-address", "rune-grpc-insecure",
+		"rune-release-collection", "rune-website-address",
+	} {
+		if f := flag.Lookup(name); f != nil && f.Value.String() != f.DefValue {
+			ret = append(ret, "--"+name+"="+f.Value.String())
+		}
+	}
+	return ret
 }
 
 // startServerLog points the log at the workspace server log: nobody
@@ -207,8 +219,11 @@ func stopOnSignal(stop func()) func() {
 
 // startMachineServer starts the workspace server of this machine: every
 // workspace under "/" is served from one process, which is what keeps
-// their terminals alive beyond any Rune client.
-func startMachineServer(shellRCDir string) (*workspaced.Server, error) {
+// their terminals alive beyond any Rune client. registerServices adds
+// what else this process serves on the same socket.
+func startMachineServer(
+	shellRCDir string, registerServices func(*grpc.Server),
+) (*workspaced.Server, error) {
 	uri, err := workspaceapi.CurrentUserHostURI("/")
 	if err != nil {
 		return nil, fmt.Errorf("root workspace URI: %w", err)
@@ -219,8 +234,9 @@ func startMachineServer(shellRCDir string) (*workspaced.Server, error) {
 		return nil, fmt.Errorf("root workspace scheme: %w", err)
 	}
 	return workspaced.Start(workspaced.Options{
-		DataDir:       *flagDataPath,
-		Scheme:        scheme,
-		ServerOptions: workspaceServerOptions(),
+		DataDir:          *flagDataPath,
+		Scheme:           scheme,
+		ServerOptions:    workspaceServerOptions(),
+		RegisterServices: registerServices,
 	})
 }

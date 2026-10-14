@@ -32,11 +32,16 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
+	"google.golang.org/grpc"
 	"unstable.build/rune/auth"
 	"unstable.build/rune/cmd/rune/ide/apiclient"
+	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/ide"
 	"unstable.build/rune/internal/ide/hostenv"
+	"unstable.build/rune/internal/ide/idepkg"
+	"unstable.build/rune/internal/ide/idepkg/pkgrpc"
 	"unstable.build/rune/internal/runenet"
+	"unstable.build/rune/internal/runenet/meshdial"
 	"unstable.build/rune/internal/workspace"
 	"unstable.build/rune/internal/workspace/workspaceserver"
 )
@@ -56,15 +61,19 @@ type headlessClient interface {
 // and it is the one process that may serve them: a second one fails on
 // the data directory's lock.
 //
-// Run by an operator, it also serves the machine on the Rune network
-// when network.auto_join is set. Everything the operator would
+// It also hosts the machine's node on the Rune network, joining at
+// start when network.auto_join is set, and serves the editors on the
+// machine the node's status and connections to its peers over the
+// server's sockets. Run by an operator, everything they would
 // otherwise read out of the editor — the sign-in code, the account,
 // the node's mesh status — goes to stdout, and the editor log is teed
 // there too so the process is usable under a service manager.
 //
 // Spawned on demand by a Rune (--daemon), it logs to the server log
 // and treats a lock another instance holds as the server it was asked
-// to start: whoever spawned it connects to that one.
+// to start: whoever spawned it connects to that one. It never prompts:
+// it joins with the account the editor signed in, and says so in the
+// log when there is none.
 func runHeadless(
 	ctx context.Context, host *hostenv.Host, shellRCDir string, shellRCErr error,
 ) int {
@@ -91,18 +100,31 @@ func runHeadless(
 	}
 
 	netCfg, err := networkConfig(rootCfg, *flagDataPath)
-	if err != nil {
+	if err != nil && !*flagDaemon {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		return 1
 	}
 	applyConfigEnv(host, rootCfg)
 
+	storage := newRuneStorage(*flagDataPath)
+	apicfg := apiClientConfig(os.TempDir(), headlessAPIConfig(rootCfg))
+	// An operator's server signs itself in as a serve-only machine. A
+	// spawned one acts with the token of the editor that signed in,
+	// which only refreshes under the editor's own client.
+	apicfg.Headless = !*flagDaemon
+	client := apiclient.New(storage, apicfg, *flagDataPath)
+	defer client.Close()
+	mesh := newMeshHost(rootCfg, *flagDataPath, newNetworkGate(client), client.ReloadToken)
+
 	// The socket answers before the server is done starting, so a
 	// signal that lands in between must still stop it the clean way.
 	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
-	server, err := startMachineServer(shellRCDir)
+	server, err := startMachineServer(shellRCDir, func(grpcServer *grpc.Server) {
+		mesh.server.Register(grpcServer)
+	})
 	if err != nil {
+		_ = mesh.Close()
 		if *flagDaemon && errors.Is(err, workspaceserver.ErrLocked) {
 			log.Infof("not starting a workspace server: %v", err)
 			return 0
@@ -112,23 +134,53 @@ func runHeadless(
 	defer func() {
 		_ = server.Close()
 	}()
+	// The node goes before the workspace server: peers are served the
+	// server's scheme, so the node must stop serving them before the
+	// terminals it hands out are terminated.
+	defer func() {
+		_ = mesh.Close()
+	}()
 	log.Infof("serving this machine's workspaces on %s",
 		workspaceserver.SocketPath(*flagDataPath))
 
+	meshLis, err := workspaceserver.Listen(workspaceserver.NetSocketPath(*flagDataPath))
+	if err != nil {
+		return headlessFailure(fmt.Errorf("listen for network dials: %w", err))
+	}
+	defer func() {
+		_ = meshLis.Close()
+	}()
+	go debug.CapturePanicReport(func() {
+		if err := meshdial.Serve(ctx, meshLis, mesh.node); err != nil {
+			log.Errorf("network dial socket stopped: %v", err)
+		}
+	})
+
+	// Built only once the lock is held: the manager cleans up installs
+	// left incomplete, which must not race another server's.
+	pkgs, closePackages, err := newHeadlessPackages(ctx, storage, host, shellRCDir)
+	if err != nil {
+		return headlessFailure(err)
+	}
+	defer closePackages()
+	mesh.serveTo(server.Scheme(),
+		runenet.WithServices(func(r grpc.ServiceRegistrar) {
+			pkgrpc.NewServer(pkgs).Register(r)
+		}))
+
 	switch {
 	case *flagDaemon:
+		mesh.startAutoJoin()
 	case !netCfg.AutoJoin:
 		// An operator reads this where a headless node used to refuse
 		// to start: nothing else says why it never joins.
 		log.Infof("network.auto_join is off in %s: serving this machine only, "+
 			"not joining the Rune network", *flagConfigPath)
 	default:
-		closeNet, err := startHeadlessNetwork(ctx, rootCfg, host, shellRCDir)
-		if err != nil {
+		if err := startOperatorNetwork(ctx, client, mesh, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
 			return 1
 		}
-		defer closeNet()
 	}
 
 	waitForShutdown(ctx, server.Done())
@@ -138,6 +190,39 @@ func runHeadless(
 		return headlessFailure(fmt.Errorf("workspace server stopped: %w", err))
 	}
 	return 0
+}
+
+// headlessAPIConfig is rootCfg with telemetry off. The server is not
+// an editor session: its client reads the account token and mints
+// mesh credentials, and reporting it as a client would count every
+// machine twice.
+func headlessAPIConfig(rootCfg config.Config) config.Config {
+	m := make(map[string]any)
+	rootCfg.Iterate(func(k string, v any) { m[k] = v })
+	m["telemetry"] = map[string]any{"enabled": false}
+	return config.MapConfig(m)
+}
+
+// The node is what the mesh socket dials peers through.
+var _ meshdial.PeerDialer = (*runenet.Node)(nil)
+
+// startOperatorNetwork signs the machine in, joins the Rune network
+// and prints where the node stands to out, for an operator reading it.
+func startOperatorNetwork(
+	ctx context.Context, client headlessClient, host *meshHost, out io.Writer,
+) error {
+	if err := headlessLogin(ctx, client, out); err != nil {
+		return fmt.Errorf("login: %w", err)
+	}
+	if err := host.Join(ctx); err != nil {
+		return fmt.Errorf("could not join the network: %w", err)
+	}
+	st, err := host.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("network status: %w", err)
+	}
+	fmt.Fprint(out, formatNodeStatus(st))
+	return nil
 }
 
 // headlessFailure reports why the server could not run where whoever
@@ -153,75 +238,27 @@ func headlessFailure(err error) int {
 	return 1
 }
 
-// startHeadlessNetwork signs the machine in and joins the Rune network,
-// serving this machine's workspaces to its peers until the returned
-// function is called.
-func startHeadlessNetwork(
-	ctx context.Context, rootCfg config.Config, host *hostenv.Host, shellRCDir string,
-) (func(), error) {
-	storage := newRuneStorage(*flagDataPath)
-	apicfg := apiClientConfig(os.TempDir(), rootCfg)
-	apicfg.Headless = true
-	client := apiclient.New(storage, apicfg, *flagDataPath)
-
-	if err := headlessLogin(ctx, client, os.Stdout); err != nil {
-		client.Close()
-		return nil, fmt.Errorf("login: %w", err)
-	}
-
-	net := newNetwork(rootCfg, *flagDataPath, shellRCDir, newNetworkGate(client))
-	closeNet := func() {
-		_ = net.Close()
-		client.Close()
-	}
-
-	closePackages, err := serveHeadlessPackages(ctx, net, storage, host, shellRCDir)
-	if err != nil {
-		closeNet()
-		return nil, err
-	}
-	closeAll := func() {
-		closePackages()
-		closeNet()
-	}
-
-	if err := net.join(ctx); err != nil {
-		closeAll()
-		return nil, fmt.Errorf("could not join the network: %w", err)
-	}
-
-	st, err := net.node.Status(ctx)
-	if err != nil {
-		closeAll()
-		return nil, fmt.Errorf("network status: %w", err)
-	}
-	fmt.Fprint(os.Stdout, formatNodeStatus(st))
-	return closeAll, nil
-}
-
-// serveHeadlessPackages has peers install packages on this machine
-// through a manager of its own: there is no editor to own them. The
-// user config's gui.env is applied now and after every install that
-// changes it, so commands peers start see the installed toolchains.
-func serveHeadlessPackages(
-	ctx context.Context, net *network, rootStorage storageapi.Service,
+// newHeadlessPackages builds the manager peers install packages on this
+// machine through: there is no editor to own them. The user config's
+// gui.env is applied again after every install that changes it, so
+// commands peers start see the installed toolchains.
+func newHeadlessPackages(
+	ctx context.Context, rootStorage storageapi.Service,
 	host *hostenv.Host, shellRCDir string,
-) (func(), error) {
+) (*idepkg.Manager, func(), error) {
 	uri, err := workspaceapi.CurrentUserHostURI("/")
 	if err != nil {
-		return nil, fmt.Errorf("root workspace URI: %w", err)
+		return nil, nil, fmt.Errorf("root workspace URI: %w", err)
 	}
 	scheme, err := workspace.NewFileSchemeFunc(*flagDataPath, shellRCDir)(
 		ctx, config.NopConfig(), uri)
 	if err != nil {
-		return nil, fmt.Errorf("root workspace scheme: %w", err)
+		return nil, nil, fmt.Errorf("root workspace scheme: %w", err)
 	}
-	applyEnv := func() { applyUserConfigEnv(host) }
-	applyEnv()
 	pkgs, pkgStorage := newHostPackageManager(
-		rootStorage, newRemoteReleaseManager(), scheme, applyEnv)
-	net.packages.set(pkgs)
-	return func() {
+		rootStorage, newRemoteReleaseManager(), scheme,
+		func() { applyUserConfigEnv(host) })
+	return pkgs, func() {
 		_ = pkgStorage.Close()
 		_ = scheme.Close()
 	}, nil

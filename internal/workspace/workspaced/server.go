@@ -50,6 +50,10 @@ type Options struct {
 	Scheme schemeapi.Scheme
 	// ServerOptions are appended to the RPC server's defaults.
 	ServerOptions []grpc.ServerOption
+	// RegisterServices, when set, installs extra services on the RPC
+	// server before it starts serving. It is how the process hosting
+	// the server exposes what else it owns on the same socket.
+	RegisterServices func(*grpc.Server)
 }
 
 // Server is a running workspace server.
@@ -99,6 +103,9 @@ func Start(opts Options) (*Server, error) {
 		grpc.KeepaliveEnforcementPolicy(remotescheme.ServerEnforcement),
 	}, opts.ServerOptions...)...)
 	workspacerpc.RegisterServices(s.grpc, s.rpc)
+	if opts.RegisterServices != nil {
+		opts.RegisterServices(s.grpc)
+	}
 
 	// Clients treat the RPC socket accepting as the server being
 	// reachable, so the attachment socket is bound first: by the time
@@ -138,6 +145,15 @@ func (s *Server) abort() {
 	_ = s.rpc.Stop()
 	_ = s.terminals.Close()
 	_ = s.lock.Release()
+}
+
+// Scheme is the machine's root scheme as this server serves it: the
+// one handed to Start, decorated with the terminals the server owns.
+// Serving it elsewhere — to peers on the Rune network — gives them the
+// same persistent terminals a client of the sockets gets. It is owned
+// by the server and must not be closed by the caller.
+func (s *Server) Scheme() vtescheme.Scheme {
+	return s.terminals
 }
 
 // fail stops a server whose listener died on its own: a server that

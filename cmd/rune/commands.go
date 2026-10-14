@@ -49,27 +49,32 @@ const (
 var fullscreen bool
 
 func subscribeCommands(
-	g *gui.GUI, c *apiclient.Client,
+	g *gui.GUI, c *apiclient.Client, net *network,
 	i *ide.IDE, transparentEnabled bool, configPath string,
 	launchCmd []string,
 ) (ret error) {
 	if err := subscribeGUICommands(g, i, transparentEnabled, launchCmd); err != nil {
 		ret = multierror.Append(ret, err)
 	}
-	if err := subscribeOtherCommands(i, c, configPath); err != nil {
+	if err := subscribeOtherCommands(i, c, net, configPath); err != nil {
 		ret = multierror.Append(ret, err)
 	}
 	return ret
 }
 
+// subscribeOtherCommands registers the commands every editor has. The
+// network reacts to `login` and `logout`: a machine the user wants on
+// the network joins with the account they signed into, and leaves it
+// when they sign out.
 func subscribeOtherCommands(
-	i *ide.IDE, c *apiclient.Client, configPath string,
+	i *ide.IDE, c *apiclient.Client, net *network, configPath string,
 ) (ret error) {
+	loginClient := net.loginClient(c)
 	for _, register := range []func(loginshell.Client) (textapi.CommandManual, textapi.REPLHandler){
 		loginshell.Login,
 		loginshell.Logout,
 	} {
-		cmd, handler := register(c)
+		cmd, handler := register(loginClient)
 		if err := i.RegisterREPLCommand(cmd, handler); err != nil {
 			ret = multierror.Append(ret,
 				fmt.Errorf("register repl '%s': %v", cmd.Name, err))
