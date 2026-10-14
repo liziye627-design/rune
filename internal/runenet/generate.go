@@ -17,3 +17,4 @@
 package runenet
 
 //go:generate protoc runenetpb/runenet.proto --go_out=. --go-grpc_out=. --go_opt=Mrunenetpb/runenet.proto=/runenetpb
+//go:generate protoc meshrpc/mesh.proto --go_out=. --go-grpc_out=. --go_opt=Mmeshrpc/mesh.proto=/meshrpc

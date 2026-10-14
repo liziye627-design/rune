@@ -1,0 +1,104 @@
+// Copyright (C) 2017-2026 The Rune Authors
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at
+// your option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+syntax = "proto3";
+option go_package = "/meshrpc";
+
+package runemesh;
+
+// Mesh is the workspace server's hosting of this machine's network
+// node, exposed to the Rune clients on the same machine. Every method
+// mirrors one of runenet.Node's; errors carry an ErrorDetail so the
+// runenet.Err* sentinels survive the hop.
+service Mesh {
+	rpc Status(StatusRequest) returns (StatusResponse);
+	rpc Peers(PeersRequest) returns (PeersResponse);
+	// Join brings the node online without waiting for membership.
+	rpc Join(JoinRequest) returns (JoinResponse);
+	// Up joins and blocks until this machine is a member.
+	rpc Up(UpRequest) returns (UpResponse);
+	// Rejoin re-registers the machine even when the backend still
+	// believes it is a member.
+	rpc Rejoin(RejoinRequest) returns (RejoinResponse);
+	rpc Down(DownRequest) returns (DownResponse);
+	// Watch streams one Event on subscribe and one whenever the node's
+	// state, its peers or its registration with the account changes.
+	rpc Watch(WatchRequest) returns (stream Event);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+	string hostname = 1;
+	repeated string addrs = 2;
+	string control_url = 3;
+	string state = 4;
+	string auth_url = 5;
+	string login_name = 6;
+	string last_error = 7;
+	string machine_id = 8;
+}
+
+message PeersRequest {}
+
+message PeersResponse {
+	repeated Peer peers = 1;
+}
+
+message Peer {
+	string hostname = 1;
+	string dns_name = 2;
+	repeated string addrs = 3;
+	string os = 4;
+	bool online = 5;
+}
+
+message JoinRequest {}
+message JoinResponse {}
+
+message UpRequest {}
+message UpResponse {}
+
+message RejoinRequest {}
+message RejoinResponse {}
+
+message DownRequest {}
+message DownResponse {}
+
+message WatchRequest {}
+
+message Event {
+	StatusResponse status = 1;
+	repeated Peer peers = 2;
+	// machine_removed is set once the account's machine list no longer
+	// has this machine in it, and cleared when it is registered again.
+	bool machine_removed = 3;
+}
+
+// ErrorDetail names the runenet sentinel an error wraps. It travels as
+// a gRPC status detail.
+message ErrorDetail {
+	enum Kind {
+		NONE = 0;
+		NOT_STARTED = 1;
+		NOT_AUTHENTICATED = 2;
+		SUBSCRIPTION_REQUIRED = 3;
+		MACHINE_LIMIT = 4;
+		PEER_NOT_FOUND = 5;
+		MACHINE_REMOVED = 6;
+	}
+	Kind kind = 1;
+}
