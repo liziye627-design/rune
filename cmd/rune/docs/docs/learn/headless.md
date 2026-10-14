@@ -430,6 +430,36 @@ the old one stays in `network machines` as offline until you
 The [network limits](./network.md#how-many-machines-you-can-have) are
 2 nodes on Free, 10 on Rune Pro, and unlimited on Enterprise.
 
+## The Dock icon
+
+On a Mac you use, the workspace server is the one Rune starts for you,
+and the Dock shows what it keeps alive. Quit Rune with terminals open
+and a badge on its Dock icon counts the ones still running a program;
+while Rune is open, it counts only the ones no window shows. Right-click
+or hold the icon for the menu:
+
+- **Terminals** lists them by workspace, each by its title, else the
+  program it was started with, else `shell`, with `(exited)` after one
+  whose program has ended. Choosing one opens its workspace in Rune,
+  and attaches to the terminal. While Rune is not running, choosing one
+  starts Rune on that workspace, which brings back the terminals its
+  last session showed.
+- **Open Server Log** opens `~/.rune/server.log`, where a server Rune
+  started writes. A server you run yourself logs as described in
+  [Operating the node](#operating-the-node).
+- **Quit Background Terminals…** stops the server, after asking: every
+  terminal it holds ends with it, as does the machine's place on the
+  network until the next Rune start. It is only there while Rune is not
+  running; quitting Rune leaves the server up.
+
+The menu starts with the machine's standing on the Rune network; see
+[The Dock icon](./network.md#the-dock-icon) there, including how to
+turn the Dock extension off. The Dock reads the default data directory,
+`~/.rune`: a server started with another `--datadir` is not reflected in
+it. A server the launchd recipe above runs is: it serves `~/.rune`, and
+**Quit Background Terminals…** stops it the way `launchctl bootout`
+does, with no restart until the next login.
+
 ## Troubleshooting
 
 **`network.auto_join is off` in the log.** The node runs but does not

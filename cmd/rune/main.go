@@ -768,6 +768,7 @@ func runGUI(
 		}
 	}
 	root.publishAppMenuInstall()
+	root.startDockTile()
 	err = g.Run("Rune")
 	if err != nil && !errors.Is(err, gui.ErrHandlerExited) {
 		fmt.Printf("%s", err)

@@ -88,6 +88,7 @@ type bootstrapHandler struct {
 	upgradeMgr        *ideupgrade.Manager
 	upgradeCancel     context.CancelFunc
 	network           *network
+	dockTile          *dockTileWatcher
 	rootCfg           config.Config
 	lastTabsClick     time.Time
 	clickCount        int
@@ -623,6 +624,9 @@ func (b *bootstrapHandler) performSwap() error {
 	b.network = newNetwork(b.rootCfg, b.dataDir, newNetworkGate(client),
 		workspaceServerCommand(b.dataDir, b.configPath))
 	b.network.startAutoJoin()
+	if b.dockTile != nil {
+		b.network.observe(b.dockTile.kick)
+	}
 	realIDE, err := b.buildConfiguredIDE(client, releaseManager, true)
 	if err != nil {
 		_ = client.Close()
@@ -865,6 +869,10 @@ func (b *bootstrapHandler) writePresetConfig() error {
 func (b *bootstrapHandler) Close() error {
 	b.closingPreIDE = true
 	var errs []error
+	if b.dockTile != nil {
+		b.dockTile.Close()
+		b.dockTile = nil
+	}
 	if b.network != nil {
 		if err := b.network.Close(); err != nil {
 			errs = append(errs, err)

@@ -208,34 +208,44 @@ func TestNetworkWatchPromptsOnRemoval(t *testing.T) {
 	net, server := serveMeshHost(t, signedIn(), host)
 	counting := &countingPrompter{}
 	net.setPrompter(counting.prompter())
+	var changes atomic.Int32
+	net.observe(func() { changes.Add(1) })
 	watchDone := make(chan struct{})
 	go debug.CapturePanicReport(func() {
 		defer close(watchDone)
 		net.watch()
 	})
 
-	prompted := func(n int32) {
+	seen := func(n int32) {
 		t.Helper()
-		assert.Eventually(t, func() bool { return counting.prompts.Load() == n },
+		require.Eventually(t, func() bool { return changes.Load() >= n },
 			5*time.Second, 10*time.Millisecond)
 	}
+	// Each change is waited for, so the server never coalesces two
+	// of them into one, and seeing a change means the watch is done
+	// with the one before it.
+	notify := func() {
+		t.Helper()
+		next := changes.Load() + 1
+		server.Notify()
+		seen(next)
+	}
+	// The watch reports the node once it subscribes.
+	seen(1)
 
 	host.removed.Store(true)
-	server.Notify()
-	prompted(1)
-
-	server.Notify()
-	time.Sleep(50 * time.Millisecond)
+	notify()
+	notify()
+	host.removed.Store(false)
+	notify()
 	assert.Equal(t, int32(1), counting.prompts.Load(), "a removal is shown once")
 
-	host.removed.Store(false)
-	server.Notify()
-	// The server coalesces notifications, so the registration has to
-	// be seen before the next removal or the two collapse into one.
-	time.Sleep(100 * time.Millisecond)
 	host.removed.Store(true)
-	server.Notify()
-	prompted(2)
+	notify()
+	host.removed.Store(false)
+	notify()
+	assert.Equal(t, int32(2), counting.prompts.Load(),
+		"a removal after a registration is shown again")
 
 	require.NoError(t, net.Close())
 	select {

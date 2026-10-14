@@ -358,6 +358,37 @@ A machine's network identity is stored in your Rune data directory,
 under `~/.rune/runenet`. `network down` leaves the network but keeps that
 identity, so `network up` rejoins without a new sign-in.
 
+## The Dock icon
+
+On macOS, Rune's Dock icon shows the network whether Rune is open or
+not: its menu starts with a dot and the machine's standing. Green is
+connected, as `network status` would report `Running`, with the name
+the machine goes by; gray is not connected; amber is a machine that
+could not join, with the reason, or one waiting for you to sign in.
+Below it:
+
+- **Peers** lists the machines on your network, with a green dot for
+  the ones online and a gray one for the rest, as `network peers` does.
+  Choosing one opens `rune://<machine>/`, that machine's home directory,
+  in Rune, starting Rune when it is not running.
+- **Connect to Network** and **Disconnect from Network** are `network
+  up` and `network down`. They act on the workspace server, so they work
+  while Rune is closed too: a laptop can leave the network for the
+  night without opening the editor.
+
+Right-click or hold the icon to see the menu. While Rune is running its
+own window serves the menu; while it is not, a Dock tile extension that
+ships with Rune does, reading what the workspace server publishes. The
+first launch of Rune registers the extension, and macOS says so in a
+notification. It can be turned off under System Settings > General >
+Login Items & Extensions > Dock Tiles, which leaves the icon plain
+whenever Rune is closed. The extension reads the default data directory,
+`~/.rune`: a server started with another `--datadir` is not reflected in
+the Dock.
+
+The same menu lists the machine's background terminals; see
+[Headless](./headless.md#the-dock-icon).
+
 ## `rune://` and `ssh://`
 
 Both schemes open a directory on another machine and behave the same way

@@ -54,7 +54,9 @@ typedef NS_ENUM(NSInteger, RuneDot) {
 - (NSMenu *)menuForStatus:(nullable RuneStatus *)status;
 
 /// The image of dot, drawn rather than shipped so the plug-in has no
-/// resources to load from inside the Dock. nil for RuneDotNone.
+/// resources to load from inside the Dock. nil for RuneDotNone. Rune's
+/// own Dock menu (internal/term/gui/docktile) draws the same dots and
+/// cannot link this code, so the two change together.
 + (nullable NSImage *)imageForDot:(RuneDot)dot;
 
 @end

@@ -23,6 +23,7 @@ import (
 	"net"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -83,6 +84,9 @@ type network struct {
 	// prompter is only there once the IDE exists; a push that lands
 	// before then has nowhere to be shown.
 	prompter *networkPrompter
+	// onChange is told of every change the workspace server reports
+	// about the node, so whatever else shows the node can re-read it.
+	onChange atomic.Pointer[func()]
 
 	watchCtx    context.Context
 	cancelWatch context.CancelFunc
@@ -441,6 +445,9 @@ func (n *network) watch() {
 	for ctx.Err() == nil {
 		if events, err := n.subscribe(ctx); err == nil {
 			for ev := range events {
+				if fn := n.onChange.Load(); fn != nil {
+					(*fn)()
+				}
 				if !ev.MachineRemoved {
 					shown = false
 					continue
@@ -459,6 +466,12 @@ func (n *network) watch() {
 		case <-time.After(watchRetryDelay):
 		}
 	}
+}
+
+// observe has fn called whenever the workspace server reports a change
+// to the node, on the watch goroutine.
+func (n *network) observe(fn func()) {
+	n.onChange.Store(&fn)
 }
 
 func (n *network) subscribe(ctx context.Context) (<-chan meshrpc.Change, error) {
