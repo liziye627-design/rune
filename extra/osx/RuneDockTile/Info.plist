@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>RuneDockTile</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.rune.docktile</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>RuneDockTile</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>{{VERSION}}</string>
+  <key>CFBundleVersion</key>
+  <string>{{COMMIT}}</string>
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.3</string>
+  <key>NSPrincipalClass</key>
+  <string>RuneDockTilePlugIn</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2023-2026 Unstable Build LLC. All Rights Reserved.</string>
+</dict>
+</plist>

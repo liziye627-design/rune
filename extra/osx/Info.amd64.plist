@@ -30,6 +30,8 @@
   <true/>
   <key>NSMainNibFile</key>
   <string>MainMenu.nib</string>
+  <key>NSDockTilePlugIn</key>
+  <string>RuneDockTile.docktileplugin</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key>
   <true/>
   <key>CFBundleDisplayName</key>

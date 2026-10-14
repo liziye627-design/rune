@@ -119,6 +119,15 @@ APP_EXTRAS_DIR := $(APP_DIR)/$(APP_NAME)/Contents/Resources
 APP_PLIST := $(APP_DIR)/$(APP_NAME)/Contents/Info.plist
 APP_PLIST_AMD64 := $(abspath $(ROOT_DIR)/extra/osx/Info.amd64.plist)
 APP_ICON := $(APP_EXTRAS_DIR)/rune.icns
+APP_PLUGINS_DIR := $(APP_DIR)/$(APP_NAME)/Contents/PlugIns
+# The Dock tile plug-in shows what the background workspace server keeps
+# alive while Rune is not running. It is built apart from the app, since
+# the app rules start by wiping RUNE_RELEASE_DIR, and copied in before
+# signing so codesign --deep covers it. The app plists name it under
+# NSDockTilePlugIn.
+DOCK_TILE_NAME := RuneDockTile.docktileplugin
+DOCK_TILE_BUILD := $(abspath $(ROOT_DIR)/extra/osx/RuneDockTile/build.sh)
+DOCK_TILE_DIR := $(TARGET)/rune_darwin_docktile
 DMG_NAME := Rune.dmg
 DMG_NAME_AMD64 := Rune-amd64.dmg
 DMG_DIR := $(RUNE_RELEASE_DIR)
@@ -134,6 +143,7 @@ SED_INPLACE = ''
 endif
 
 .PHONY: clean make-release release release-amd64 release-arm64 app-amd64 app-arm64 dmg dmg-amd64 dmg-notarize dmg-amd64-notarize release-all \
+	dock-tile-amd64 dock-tile-arm64 \
 	linux-cross-compile \
 	make-release-linux app-linux install-linux \
 	release-linux-amd64 release-linux-arm64 \
@@ -202,7 +212,18 @@ release:
 	@TARGET_OS=darwin TARGET_ARCH=amd64 TARGET_ARCH_FLAGS='$(DARWIN_AMD64_TARGET_ARCH_FLAGS)' $(MAKE) make-release
 	@cd $(TARGET) && tar -czvf rune-release-`git describe --tags --dirty`.tar.gz rune_darwin_arm64 rune_darwin_amd64
 
-app-amd64:
+# dock-tile-<arch> builds the Dock tile plug-in for the app of that arch
+# at the app's own deployment target: the Dock refuses to load a plug-in
+# built for a newer macOS than the app that ships it.
+dock-tile-arm64: DOCK_TILE_ARCH := arm64
+dock-tile-arm64: DOCK_TILE_MIN_MACOS := $(DARWIN_ARM64_MIN_MACOS)
+dock-tile-amd64: DOCK_TILE_ARCH := x86_64
+dock-tile-amd64: DOCK_TILE_MIN_MACOS := $(DARWIN_AMD64_MIN_MACOS)
+dock-tile-arm64 dock-tile-amd64:
+	@rm -rf $(DOCK_TILE_DIR)/$(@:dock-tile-%=%)
+	@VERSION="$(VERSION)" COMMIT="$(COMMIT)" $(DOCK_TILE_BUILD) $(DOCK_TILE_ARCH) $(DOCK_TILE_MIN_MACOS) $(DOCK_TILE_DIR)/$(@:dock-tile-%=%)
+
+app-amd64: dock-tile-amd64
 	@rm -rf $(RUNE_RELEASE_DIR)
 	@mkdir -p $(RUNE_RELEASE_DIR)
 	@cd $(ROOT_DIR) && ./cmd/rune/cgo-build-guard.sh 'CGO_ENABLED=1 GOARCH=amd64 $(DARWIN_AMD64_TARGET_ARCH_FLAGS) GOOS=darwin $(GO) build $(RUNE_GOFLAGS) -o $(APP_BINARY) ./cmd/rune'
@@ -215,12 +236,14 @@ app-amd64:
 	@sed -i $(SED_INPLACE) -e 's/{{VERSION}}/$(VERSION)/g' -e 's/{{COMMIT}}/$(COMMIT)/g' $(APP_PLIST)
 	@cd $(ROOT_DIR)/extra && iconutil -c icns icon.iconset
 	@mv $(ROOT_DIR)/extra/icon.icns $(APP_ICON)
+	@mkdir -p $(APP_PLUGINS_DIR)
+	@cp -fRp $(DOCK_TILE_DIR)/amd64/$(DOCK_TILE_NAME) $(APP_PLUGINS_DIR)/
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
 	@rm -f $(APP_BINARY)
 	@codesign --force --deep --options runtime --sign "$(CODESIGN_IDENTITY)" "$(APP_DIR)/$(APP_NAME)"
 	@echo "Created '$(APP_NAME)' in '$(APP_DIR)'"
 
-app-arm64:
+app-arm64: dock-tile-arm64
 	@rm -rf $(RUNE_RELEASE_DIR)
 	@mkdir -p $(RUNE_RELEASE_DIR)
 	@cd $(ROOT_DIR) && ./cmd/rune/cgo-build-guard.sh 'CGO_ENABLED=1 GOARCH=arm64 $(DARWIN_ARM64_TARGET_ARCH_FLAGS) GOOS=darwin $(GO) build $(RUNE_GOFLAGS) -o $(APP_BINARY) ./cmd/rune'
@@ -232,6 +255,8 @@ app-arm64:
 	@sed -i $(SED_INPLACE) -e 's/{{VERSION}}/$(VERSION)/g' -e 's/{{COMMIT}}/$(COMMIT)/g' $(APP_PLIST)
 	@cd $(ROOT_DIR)/extra && iconutil -c icns icon.iconset
 	@mv $(ROOT_DIR)/extra/icon.icns $(APP_ICON)
+	@mkdir -p $(APP_PLUGINS_DIR)
+	@cp -fRp $(DOCK_TILE_DIR)/arm64/$(DOCK_TILE_NAME) $(APP_PLUGINS_DIR)/
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
 	@rm -f $(APP_BINARY)
 	@codesign --force --deep --options runtime --sign "$(CODESIGN_IDENTITY)" "$(APP_DIR)/$(APP_NAME)"
@@ -324,7 +349,7 @@ release-all: dmg-notarize
 #   open $(RUNE_RELEASE_DIR)/Rune.app
 #   dlv attach $$(pgrep -n rune)
 app-delve: RUNE_DEBUG_BUILD := true
-app-delve:
+app-delve: dock-tile-$(HOST_ARCH)
 	@rm -rf $(RUNE_RELEASE_DIR)
 	@mkdir -p $(RUNE_RELEASE_DIR)
 	@cd $(ROOT_DIR) && CGO_ENABLED=1 GOOS=darwin $(GO) build -gcflags="all=-N -l" $(RUNE_GOFLAGS) -o $(APP_BINARY) ./cmd/rune
@@ -336,6 +361,8 @@ app-delve:
 	@sed -i $(SED_INPLACE) -e 's/{{VERSION}}/$(VERSION)/g' -e 's/{{COMMIT}}/$(COMMIT)/g' $(APP_PLIST)
 	@cd $(ROOT_DIR)/extra && iconutil -c icns icon.iconset
 	@mv $(ROOT_DIR)/extra/icon.icns $(APP_ICON)
+	@mkdir -p $(APP_PLUGINS_DIR)
+	@cp -fRp $(DOCK_TILE_DIR)/$(HOST_ARCH)/$(DOCK_TILE_NAME) $(APP_PLUGINS_DIR)/
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
 	@rm -f $(APP_BINARY)
 	@printf '%s\n' \
