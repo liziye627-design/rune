@@ -40,6 +40,7 @@ import (
 	tcomponent "unstable.build/rune/internal/component"
 	"unstable.build/rune/internal/term/vte"
 	"unstable.build/rune/internal/text"
+	"unstable.build/rune/internal/workspace"
 )
 
 const (
@@ -96,12 +97,20 @@ type File struct {
 
 // TerminalSession is a serialized open-terminal session.
 type TerminalSession struct {
-	Name     string
-	Snapshot vte.Snapshot
-	Tab      bool
-	Visible  bool
-	Focus    bool
-	WindowID uint64
+	Name string
+	// VTEID names the emulator this session was attached to. The
+	// emulator outlives Rune, so restoring means reattaching to it;
+	// Snapshot is only the fallback for one the workspace has
+	// confirmed is gone.
+	VTEID workspace.VTEID
+	// CommandAndArgs is what the terminal was opened with, so a
+	// replacement can be created with the same intent.
+	CommandAndArgs []string
+	Snapshot       vte.Snapshot
+	Tab            bool
+	Visible        bool
+	Focus          bool
+	WindowID       uint64
 }
 
 // TaskSession is a serialized open-task session.
@@ -487,12 +496,14 @@ type fileDoc struct {
 }
 
 type terminalDoc struct {
-	Name     string
-	Snapshot vte.Snapshot
-	Tab      bool
-	Visible  bool
-	Focus    bool
-	WindowID uint64
+	Name           string
+	VTEID          workspace.VTEID
+	CommandAndArgs []string
+	Snapshot       vte.Snapshot
+	Tab            bool
+	Visible        bool
+	Focus          bool
+	WindowID       uint64
 }
 
 type taskDoc struct {

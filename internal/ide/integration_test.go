@@ -48,7 +48,8 @@ func newIntegrationTestCase(t *testing.T, content string) (
 	mu := new(sync.Mutex)
 	sched, drainSched := newTestScheduler(t, mu)
 	manager := workspace.NewManager(config.NopConfig(), sched)
-	require.NoError(t, manager.RegisterScheme(workspace.FileScheme, workspace.NewFileScheme))
+	require.NoError(t, manager.RegisterScheme(workspace.FileScheme,
+		terminalSchemeFunc(workspace.NewFileScheme)))
 	w, err := manager.AddWorkspace(context.Background(), workspaceURI)
 	require.NoError(t, err)
 

@@ -40,6 +40,7 @@ import (
 	tcomponent "unstable.build/rune/internal/component"
 	localstoragerpc "unstable.build/rune/internal/localstorage/storagerpc"
 	"unstable.build/rune/internal/term/vte"
+	"unstable.build/rune/internal/workspace"
 )
 
 func mustURI(t *testing.T, s string) workspaceapi.URI {
@@ -132,6 +133,31 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	assert.Equal(t, want.Files[0].URI, got.Files[0].URI)
 	assert.Equal(t, want.Files[0].Cursor, got.Files[0].Cursor)
 	assert.True(t, got.HasLayout)
+}
+
+func TestStoreLoadRoundTripTerminalSession(t *testing.T) {
+	store := New(newCountingStorage())
+	uri := mustURI(t, "memory:///terminal-session")
+	want := TerminalSession{
+		Name:           "build",
+		VTEID:          workspace.NewVTEID(),
+		CommandAndArgs: []string{"make", "-j8"},
+		Tab:            true,
+		Visible:        true,
+		Focus:          true,
+		WindowID:       7,
+	}
+	require.NoError(t, store.StoreWorkspaceState(context.Background(), uri,
+		State{Terminals: []TerminalSession{want}}))
+
+	got, err := store.LoadWorkspaceState(context.Background(), uri)
+	require.NoError(t, err)
+	require.Len(t, got.Terminals, 1)
+	session := got.Terminals[0]
+	// The snapshot decodes empty screens as empty rather than nil
+	// slices; its round trip is covered by the snapshot tests below.
+	session.Snapshot = vte.Snapshot{}
+	assert.Equal(t, want, session)
 }
 
 func TestStoreNestedLayoutRoundTrip(t *testing.T) {

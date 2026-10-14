@@ -87,7 +87,7 @@ func TestAddWorkspaceNotificationRace(t *testing.T) {
 
 	manager := workspace.NewManager(cfg.workspace(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 
 	dir := t.TempDir()
 	storage := localstorage.New(context.Background(), dir, docbson.Marshaler())

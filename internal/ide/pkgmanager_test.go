@@ -1144,7 +1144,8 @@ func newTestWorkspaceManagerHandlerForPkgManager(
 	// in the package working directory.
 	cfg.configPath = filepath.Join(dir, "rune.yaml")
 	manager := workspace.NewManager(cfg.workspace(), cfg.scheduleNextTick)
-	manager.RegisterScheme(workspace.FileScheme, workspace.NewFileScheme)
+	manager.RegisterScheme(workspace.FileScheme,
+		terminalSchemeFunc(workspace.NewFileScheme))
 
 	notiCfg := notificationsConfig()
 	notiCfg.Width = notificationsWidth
@@ -1187,7 +1188,8 @@ func newTestWorkspaceManagerHandlerForPkgManagerWithInterrupterCfg(
 	// Share the caller's (deliberately synchronous) scheduler so the
 	// manager and the handler dispatch through the same path.
 	manager := workspace.NewManager(cfg.workspace(), cfg.scheduleNextTick)
-	manager.RegisterScheme(workspace.FileScheme, workspace.NewFileScheme)
+	manager.RegisterScheme(workspace.FileScheme,
+		terminalSchemeFunc(workspace.NewFileScheme))
 	ret := newTestWorkspaceManagerHandlerWithReleaseManager(t, manager,
 		cfg, FuncExtensionsRunner(testRunnerFn), nil, nil, dir, nil,
 		nopShutdownShaderConfig(), releaseManager, showManual, interrupter, mu)

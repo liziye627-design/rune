@@ -26,16 +26,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
-	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/component"
 	"github.com/unstablebuild/rune-go-sdk/term"
-	"unstable.build/rune/internal/browser/browsertest"
-	"unstable.build/rune/internal/term/programstatus"
 	"unstable.build/rune/internal/term/vte"
-	"unstable.build/rune/internal/workspace/workspacetest"
+	"unstable.build/rune/internal/workspace"
 )
 
 func TestFacility(t *testing.T) {
@@ -43,7 +39,7 @@ func TestFacility(t *testing.T) {
 	t.Run("pre-allocates initial capacity", func(t *testing.T) {
 		t.Parallel()
 		var called atomic.Int64
-		f := newTestFacility(5, func(f *Facility) (VTE, error) {
+		f := newTestFacility(5, func(f *Facility) (workspace.VTE, error) {
 			called.Add(1)
 			return newTestVte(f), nil
 		})
@@ -58,7 +54,7 @@ func TestFacility(t *testing.T) {
 	t.Run("pre-allocates if pool is empty", func(t *testing.T) {
 		t.Parallel()
 		var called atomic.Int64
-		f := newTestFacility(1, func(f *Facility) (VTE, error) {
+		f := newTestFacility(1, func(f *Facility) (workspace.VTE, error) {
 			called.Add(1)
 			return newTestVte(f), nil
 		})
@@ -73,7 +69,7 @@ func TestFacility(t *testing.T) {
 	t.Run("refill failure does not cost the caller the warm VTE", func(t *testing.T) {
 		t.Parallel()
 		var called atomic.Int64
-		f := newTestFacility(2, func(f *Facility) (VTE, error) {
+		f := newTestFacility(2, func(f *Facility) (workspace.VTE, error) {
 			// Warm-up (calls 1-2) succeeds; the opportunistic
 			// refill triggered by draining the pool (call 3) fails.
 			if called.Add(1) > 2 {
@@ -103,7 +99,7 @@ func TestFacility(t *testing.T) {
 		// that never opened.
 		var mu sync.Mutex
 		var created []*recordingVTE
-		f := newTestFacility(2, func(f *Facility) (VTE, error) {
+		f := newTestFacility(2, func(f *Facility) (workspace.VTE, error) {
 			v := newRecordingVTE()
 			mu.Lock()
 			defer mu.Unlock()
@@ -134,7 +130,7 @@ func TestFacility(t *testing.T) {
 		t.Parallel()
 		var mu sync.Mutex
 		var created []*testVte
-		f := newTestFacility(5, func(f *Facility) (VTE, error) {
+		f := newTestFacility(5, func(f *Facility) (workspace.VTE, error) {
 			tvte := newTestVte(f)
 			mu.Lock()
 			defer mu.Unlock()
@@ -158,119 +154,27 @@ func TestFacility(t *testing.T) {
 		}
 	})
 
-	t.Run("VTE.Close puts vte back into the pool", func(t *testing.T) {
-		t.Parallel()
-		var called atomic.Int32
-		f := newTestFacility(2, func(f *Facility) (VTE, error) {
-			tvte := newTestVte(f)
-			called.Add(1)
-			return tvte, nil
-		})
-
-		vte, err := f.Get()
-		require.NoError(t, err)
-
-		require.NoError(t, vte.Close())
-
-		vte, err = f.Get()
-		require.NoError(t, err)
-
-		assert.Equal(t, 2, int(called.Load()))
-	})
-
-	t.Run("put rejects VTE above initial capacity", func(t *testing.T) {
-		t.Parallel()
-		f := newTestFacility(1, func(f *Facility) (VTE, error) {
-			return newTestVte(f), nil
-		})
-
-		borrowed, err := f.Get()
-		require.NoError(t, err)
-		require.Equal(t, 1, f.Capacity())
-
-		assert.False(t, f.put(borrowed))
-		require.Equal(t, 1, f.Capacity())
-	})
-
-	t.Run("VTE.Close does not put vte back into the pool, if used alternate buffer", func(t *testing.T) {
-		t.Parallel()
-		var called atomic.Int32
-		f := newTestFacility(2, func(f *Facility) (VTE, error) {
-			tvte := newTestVte(f)
-			tvte.usedAlt = true
-			called.Add(1)
-			return tvte, nil
-		})
-
-		vte, err := f.Get()
-		require.NoError(t, err)
-
-		require.NoError(t, vte.Close())
-
-		vte, err = f.Get()
-		require.NoError(t, err)
-
-		assert.Equal(t, 3, int(called.Load()))
-	})
-
-	t.Run("VTE.Close clears the primary buffer when put back into pool", func(t *testing.T) {
-		t.Parallel()
-		f := newTestFacility(2, func(f *Facility) (VTE, error) {
-			return newTestVte(f), nil
-		})
-
-		pooled, err := f.Get()
-		require.NoError(t, err)
-		tvte := pooled.(*testVte)
-
-		require.NoError(t, pooled.Close())
-
-		assert.True(t, tvte.clearedPrimary)
-	})
-
 	t.Run("Resize after new doesn't block waiting for all vtes to be created", func(t *testing.T) {
 		t.Parallel()
-		b := nopBrowser{}
 		var wg sync.WaitGroup
 		const capacity = 5
 		wg.Add(capacity)
-		uri, err := workspaceapi.ParseURI("file:///tmp")
-		require.NoError(t, err)
-		scheme, err := workspacetest.NewNopScheme("file:///tmp")(
-			context.Background(), config.NopConfig(), uri)
-		scheme.(*workspacetest.NopScheme).NewPtyFunc = func(ctx context.Context) (workspaceapi.Pty, error) {
-			defer wg.Done()
-			return workspaceapi.Pty{
-				Master: scheme.NewFile(0, ""),
-				Slave:  scheme.NewFile(1, ""),
-			}, nil
+		terms := &funcTerminals{
+			create: func(
+				ctx context.Context, _ workspace.CreateVTEOptions,
+			) (workspace.VTE, error) {
+				wg.Done()
+				// Never completes on its own: Close cancels it.
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
 		}
-		scheme.(*workspacetest.NopScheme).StartCommandFunc = func(context.Context, workspaceapi.Cmd) (workspaceapi.Pid, error) {
-			time.Sleep(100 * time.Minute)
-			return 0, nil
-		}
-		require.NoError(t, err)
-		f := New(b, b, scheme, scheme, b, vte.DefaultConfig(), capacity)
-		// this would block for 100 minutes if not implemented correctly
+		f := New(terms, nopTerminal{}, vte.DefaultConfig(), capacity)
+		t.Cleanup(func() { _ = f.Close() })
+		// this would block until every spawn settles if Resize
+		// waited on the in-flight creations
 		f.Resize(10, 10)
 		wg.Wait()
-	})
-
-	t.Run("put does not resurrect the pool after Close", func(t *testing.T) {
-		t.Parallel()
-		f := newTestFacility(1, func(f *Facility) (VTE, error) {
-			return newTestVte(f), nil
-		})
-
-		require.NoError(t, f.Close())
-
-		// Simulate an async vteAdapter.Close() callback that fires
-		// after the facility has been closed. It must NOT re-populate
-		// the pool (which would leak the underlying VTE and its
-		// associated pty + scrollback memory).
-		stray := newTestVte(f)
-		assert.False(t, f.put(stray))
-		assert.Equal(t, 0, f.Capacity())
 	})
 
 	t.Run("Reset drains the warm pool and lets Get re-allocate", func(t *testing.T) {
@@ -279,7 +183,7 @@ func TestFacility(t *testing.T) {
 		// the ones warm at Reset time were closed.
 		var mu sync.Mutex
 		var all []*testVte
-		f := newTestFacility(2, func(f *Facility) (VTE, error) {
+		f := newTestFacility(2, func(f *Facility) (workspace.VTE, error) {
 			v := newTestVte(f)
 			mu.Lock()
 			all = append(all, v)
@@ -309,7 +213,7 @@ func TestFacility(t *testing.T) {
 
 	t.Run("Reset is a no-op after Close", func(t *testing.T) {
 		t.Parallel()
-		f := newTestFacility(1, func(f *Facility) (VTE, error) {
+		f := newTestFacility(1, func(f *Facility) (workspace.VTE, error) {
 			return newTestVte(f), nil
 		})
 		require.NoError(t, f.Close())
@@ -323,7 +227,7 @@ func TestFacility(t *testing.T) {
 		// Use recordingVTE rather than testVte so Close does not
 		// peek at f.pool without locking (which would race against
 		// the concurrent Reset below).
-		f := newTestFacility(1, func(f *Facility) (VTE, error) {
+		f := newTestFacility(1, func(f *Facility) (workspace.VTE, error) {
 			return newRecordingVTE(), nil
 		})
 		f.ctx, f.cancelCtx = context.WithCancel(context.Background())
@@ -356,7 +260,7 @@ func TestFacility(t *testing.T) {
 
 	t.Run("watchRemoteScheme exits when facility ctx is cancelled", func(t *testing.T) {
 		t.Parallel()
-		f := newTestFacility(1, func(f *Facility) (VTE, error) {
+		f := newTestFacility(1, func(f *Facility) (workspace.VTE, error) {
 			return newRecordingVTE(), nil
 		})
 		f.ctx, f.cancelCtx = context.WithCancel(context.Background())
@@ -383,7 +287,7 @@ func TestFacility(t *testing.T) {
 	t.Run("Get is served from the pool when warm", func(t *testing.T) {
 		t.Parallel()
 		var called atomic.Int64
-		f := newTestFacility(2, func(f *Facility) (VTE, error) {
+		f := newTestFacility(2, func(f *Facility) (workspace.VTE, error) {
 			called.Add(1)
 			return newTestVte(f), nil
 		})
@@ -408,32 +312,24 @@ func TestFacility(t *testing.T) {
 		// the exact race that defeats the warm pool in production.
 		release := make(chan struct{})
 		var newCalls atomic.Int64
-		b := nopBrowser{}
-		uri, err := workspaceapi.ParseURI("file:///tmp")
-		require.NoError(t, err)
-		scheme, err := workspacetest.NewNopScheme("file:///tmp")(
-			context.Background(), config.NopConfig(), uri)
-		require.NoError(t, err)
-		nop := scheme.(*workspacetest.NopScheme)
-		nop.NewPtyFunc = func(ctx context.Context) (workspaceapi.Pty, error) {
-			// Block initCap until the test releases it.
-			<-release
-			newCalls.Add(1)
-			return workspaceapi.Pty{
-				Master: scheme.NewFile(0, ""),
-				Slave:  scheme.NewFile(1, ""),
-			}, nil
+		var f *Facility
+		terms := &funcTerminals{
+			create: func(
+				context.Context, workspace.CreateVTEOptions,
+			) (workspace.VTE, error) {
+				// Block initCap until the test releases it.
+				<-release
+				newCalls.Add(1)
+				return newTestVte(f), nil
+			},
 		}
-		nop.StartCommandFunc = func(context.Context, workspaceapi.Cmd) (workspaceapi.Pid, error) {
-			return 0, nil
-		}
-		f := New(b, b, scheme, scheme, b, vte.DefaultConfig(), 2)
+		f = New(terms, nopTerminal{}, vte.DefaultConfig(), 2)
 		t.Cleanup(func() { _ = f.Close() })
 
 		// Issue a Get before initCap can deliver any VTE. It must not
 		// fall through to the from-scratch path; it must wait for the
 		// pool to be populated.
-		got := make(chan VTE, 1)
+		got := make(chan workspace.VTE, 1)
 		errCh := make(chan error, 1)
 		go func() {
 			v, err := f.Get()
@@ -470,11 +366,13 @@ func TestFacility(t *testing.T) {
 	t.Run("initCap does not resurrect a closed pool", func(t *testing.T) {
 		t.Parallel()
 		release := make(chan struct{})
+		terms := &fakeTerminals{}
 		f := new(Facility)
 		f.cond = sync.NewCond(&f.mu)
+		f.terminals = terms
 		f.initialCapacity = 3
 		f.pendingInit = 3
-		f.new = func(bool) (VTE, error) {
+		f.new = func() (workspace.VTE, error) {
 			<-release
 			return newTestVte(f), nil
 		}
@@ -493,6 +391,14 @@ func TestFacility(t *testing.T) {
 		// The pool must remain empty - initCap must not re-populate
 		// it after Close.
 		assert.Equal(t, 0, f.Capacity())
+
+		// A warm terminal nobody claimed must be deleted, not merely
+		// detached: the emulator outlives this process, so detaching
+		// would strand a terminal no client can reach.
+		require.Eventually(t, func() bool {
+			return len(terms.deletedIDs()) == 3
+		}, 5*time.Second, 10*time.Millisecond,
+			"every VTE created after Close must be deleted")
 	})
 
 	// Pins the data race where vteAdapter.Close read f.pool without
@@ -503,23 +409,12 @@ func TestFacility(t *testing.T) {
 	// pool append; the race detector flags it.
 	t.Run("adapter Close races the warm-up appends safely", func(t *testing.T) {
 		t.Parallel()
-		b := nopBrowser{}
-		uri, err := workspaceapi.ParseURI("file:///tmp")
-		require.NoError(t, err)
-		scheme, err := workspacetest.NewNopScheme("file:///tmp")(
-			context.Background(), config.NopConfig(), uri)
-		require.NoError(t, err)
-		nop := scheme.(*workspacetest.NopScheme)
-		nop.NewPtyFunc = func(ctx context.Context) (workspaceapi.Pty, error) {
-			return workspaceapi.Pty{
-				Master: scheme.NewFile(0, ""),
-				Slave:  scheme.NewFile(1, ""),
-			}, nil
-		}
-		nop.StartCommandFunc = func(context.Context, workspaceapi.Cmd) (workspaceapi.Pid, error) {
-			return 0, nil
-		}
-		f := New(b, b, scheme, scheme, b, vte.DefaultConfig(), 8)
+		// Deliberately not newTestFacility: that waits for the
+		// warm-up to settle, which is the very race under test.
+		f := newWithFactory(&fakeTerminals{},
+			func(f *Facility) (workspace.VTE, error) {
+				return newTestVte(f), nil
+			}, nopTerminal{}, 8)
 		t.Cleanup(func() { _ = f.Close() })
 
 		// Get and dispose adapters while the warm-up is still
@@ -541,22 +436,19 @@ func TestFacility(t *testing.T) {
 	// and Get's fallback allocation fail after the bound.
 	t.Run("stalled spawn does not wedge Get indefinitely", func(t *testing.T) {
 		t.Parallel()
-		b := nopBrowser{}
-		uri, err := workspaceapi.ParseURI("file:///tmp")
-		require.NoError(t, err)
-		scheme, err := workspacetest.NewNopScheme("file:///tmp")(
-			context.Background(), config.NopConfig(), uri)
-		require.NoError(t, err)
-		nop := scheme.(*workspacetest.NopScheme)
-		nop.NewPtyFunc = func(ctx context.Context) (workspaceapi.Pty, error) {
-			// Simulate a wedged transport: the RPC never returns
-			// until its context is cancelled.
-			<-ctx.Done()
-			return workspaceapi.Pty{}, ctx.Err()
+		terms := &funcTerminals{
+			create: func(
+				ctx context.Context, _ workspace.CreateVTEOptions,
+			) (workspace.VTE, error) {
+				// Simulate a wedged transport: the RPC never returns
+				// until its context is cancelled.
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
 		}
 		cfg := vte.DefaultConfig()
 		cfg.SpawnTimeout = 20 * time.Millisecond
-		f := New(b, b, scheme, scheme, b, cfg, 2)
+		f := New(terms, nopTerminal{}, cfg, 2)
 		t.Cleanup(func() { _ = f.Close() })
 
 		errCh := make(chan error, 1)
@@ -583,38 +475,30 @@ func TestFacility(t *testing.T) {
 	// as they become usable.
 	t.Run("spawn budget starts only after the remote transport resolves", func(t *testing.T) {
 		t.Parallel()
-		b := nopBrowser{}
-		uri, err := workspaceapi.ParseURI("file:///tmp")
-		require.NoError(t, err)
-		scheme, err := workspacetest.NewNopScheme("file:///tmp")(
-			context.Background(), config.NopConfig(), uri)
-		require.NoError(t, err)
-		nop := scheme.(*workspacetest.NopScheme)
-		var ptyCalls atomic.Int64
-		nop.NewPtyFunc = func(ctx context.Context) (workspaceapi.Pty, error) {
-			ptyCalls.Add(1)
-			return workspaceapi.Pty{
-				Master: scheme.NewFile(0, ""),
-				Slave:  scheme.NewFile(1, ""),
-			}, nil
-		}
-		nop.StartCommandFunc = func(context.Context, workspaceapi.Cmd) (workspaceapi.Pid, error) {
-			return 0, nil
+		var f *Facility
+		var createCalls atomic.Int64
+		terms := &funcTerminals{
+			create: func(
+				context.Context, workspace.CreateVTEOptions,
+			) (workspace.VTE, error) {
+				createCalls.Add(1)
+				return newTestVte(f), nil
+			},
 		}
 		gated := &connectGatedTerminal{
-			Terminal:     nop,
+			Terminal:     nopTerminal{},
 			connected:    make(chan struct{}),
 			disconnectCh: make(chan struct{}),
 		}
 		cfg := vte.DefaultConfig()
 		cfg.SpawnTimeout = 20 * time.Millisecond
-		f := New(b, b, gated, scheme, b, cfg, 1)
+		f = New(terms, gated, cfg, 1)
 		t.Cleanup(func() { _ = f.Close() })
 
 		// Let several spawn-timeout windows elapse while the
 		// transport is still "provisioning".
 		time.Sleep(5 * cfg.SpawnTimeout)
-		assert.EqualValues(t, 0, ptyCalls.Load(),
+		assert.EqualValues(t, 0, createCalls.Load(),
 			"no spawn RPC may be issued (and no budget consumed) "+
 				"while the transport is unresolved")
 
@@ -629,49 +513,15 @@ func TestFacility(t *testing.T) {
 	})
 }
 
-type nopBrowser struct {
-}
-
-func (n nopBrowser) PublishEvent(term.Event) error {
-	return nil
-}
-func (n nopBrowser) Notify(level browserapi.NotificationLevel, msg string, args ...any) (string, error) {
-	return "", nil
-}
-func (n nopBrowser) NotifyOnce(level browserapi.NotificationLevel, msg string, args ...any) (string, error) {
-	return "", nil
-}
-func (n nopBrowser) UpdateNotificationProgress(id, message string, progress, total int64) error {
-	return nil
-}
-func (nopBrowser) Tab(uri workspaceapi.URI, icon rune, name string, h browserapi.Handler) (
-	browserapi.Handler, error,
-) {
-	return browsertest.NewTestHandler(), nil
-}
-
-func (n nopBrowser) SetTabName(workspaceapi.URI, string, term.Attributes) error {
-	return nil
-}
-
-func (nopBrowser) OnTabExit(workspaceapi.URI) bool {
-	return false
-}
-
-func (nopBrowser) SetTabStatus(workspaceapi.URI, programstatus.Report) error { return nil }
-func (nopBrowser) EndTabStatus(workspaceapi.URI) error                       { return nil }
-
 func newTestFacility(
-	initCap int, newFn func(*Facility) (VTE, error),
+	initCap int, newFn func(*Facility) (workspace.VTE, error),
 ) *Facility {
 	// Build the facility via the same internal entrypoint
 	// production [New] uses, injecting the test factory so
 	// every test exercises the real lifecycle wiring (cond,
 	// ctx/cancelCtx, pendingInit, remote-scheme watcher) — no
 	// hand-rolled construction or private-field poking.
-	f := newWithFactory(
-		func(f *Facility, _ bool) (VTE, error) { return newFn(f) },
-		nopTerminal{}, initCap)
+	f := newWithFactory(&fakeTerminals{}, newFn, nopTerminal{}, initCap)
 	// initCap runs asynchronously in production; wait for it to
 	// settle so callers observing Capacity / called counters
 	// immediately after construction see a fully resolved pool,
@@ -679,6 +529,45 @@ func newTestFacility(
 	// provided.
 	f.WaitForInitialFill()
 	return f
+}
+
+// fakeTerminals stands in for the workspace that owns the pooled
+// emulators. Only DeleteVTE is exercised: the factory seam replaces
+// CreateVTE so tests can control allocation directly.
+type fakeTerminals struct {
+	mu      sync.Mutex
+	deleted []workspace.VTEID
+}
+
+func (f *fakeTerminals) CreateVTE(
+	context.Context, workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	return nil, errors.New("unexpected CreateVTE")
+}
+
+func (f *fakeTerminals) DeleteVTE(_ context.Context, id workspace.VTEID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleted = append(f.deleted, id)
+	return nil
+}
+
+func (f *fakeTerminals) deletedIDs() []workspace.VTEID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]workspace.VTEID(nil), f.deleted...)
+}
+
+// funcTerminals is a Terminals whose CreateVTE is supplied per test.
+type funcTerminals struct {
+	fakeTerminals
+	create func(context.Context, workspace.CreateVTEOptions) (workspace.VTE, error)
+}
+
+func (f *funcTerminals) CreateVTE(
+	ctx context.Context, opts workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	return f.create(ctx, opts)
 }
 
 // nopTerminal satisfies the schemeapi.Terminal slot required by
@@ -692,7 +581,7 @@ func (nopTerminal) NewPty(context.Context) (workspaceapi.Pty, error) {
 }
 func (nopTerminal) SetPtySize(workspaceapi.Pty, workspaceapi.PtySize) error { return nil }
 
-var _ VTE = (*testVte)(nil)
+var _ workspace.VTE = (*testVte)(nil)
 
 type testVte struct {
 	component.String
@@ -700,6 +589,7 @@ type testVte struct {
 	f              *Facility
 	usedAlt        bool
 	clearedPrimary bool
+	id             workspace.VTEID
 
 	calledClose bool
 }
@@ -713,7 +603,12 @@ func newTestVteWithConfig(f *Facility, initialCmd string) *testVte {
 	ret.initialCmd = initialCmd
 	ret.String = component.NewString(initialCmd)
 	ret.f = f
+	ret.id = workspace.NewVTEID()
 	return ret
+}
+
+func (t *testVte) ID() workspace.VTEID {
+	return t.id
 }
 
 func (t *testVte) Handle(ev term.Event) (bool, bool) {
@@ -754,14 +649,7 @@ func (t *testVte) Close() error {
 	if t.calledClose {
 		return errors.New("called close twice")
 	}
-	// Mirror vteAdapter.Close: the drained probe takes the facility
-	// lock, so a Close issued while the caller holds it deadlocks
-	// here exactly as it does in production.
-	if t.f.drained() || t.UsedAlternateBuffer() {
-		t.calledClose = true
-		return nil
-	}
-	t.f.put(t)
+	t.calledClose = true
 	return nil
 }
 
@@ -869,14 +757,17 @@ type recordingVTE struct {
 	component.String
 	closed   atomic.Bool
 	complete atomic.Bool
+	id       workspace.VTEID
 }
 
 func newRecordingVTE() *recordingVTE {
 	r := new(recordingVTE)
 	r.String = component.NewString("")
+	r.id = workspace.NewVTEID()
 	return r
 }
 
+func (r *recordingVTE) ID() workspace.VTEID            { return r.id }
 func (r *recordingVTE) Handle(term.Event) (bool, bool) { return false, false }
 func (r *recordingVTE) SeekUp() bool                   { return false }
 func (r *recordingVTE) SeekDown() bool                 { return false }

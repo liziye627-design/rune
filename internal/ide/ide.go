@@ -18,6 +18,7 @@ package ide
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -53,6 +54,7 @@ import (
 	"unstable.build/rune/internal/ide/idepkg/pkgtrust"
 	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
 	"unstable.build/rune/internal/workspace/workspacessh"
 )
 
@@ -594,7 +596,14 @@ func (i *IDE) init(
 	// register default schemes
 	workspaceManager := workspace.NewManagerWithWorkspaceFunc(
 		i.ideConfig.workspace(), op.scheduleFn, workspace.NewSchemeWorkspace)
-	err := workspaceManager.RegisterScheme(
+	// Caller-provided schemes are registered first so they win the
+	// built-in registration below.
+	for scheme, fn := range op.schemes {
+		if err := workspaceManager.RegisterScheme(scheme, fn); err != nil {
+			return fmt.Errorf("register %q scheme: %w", scheme, err)
+		}
+	}
+	err := registerBuiltinScheme(workspaceManager,
 		workspacessh.Scheme,
 		workspacessh.New(newWorkspaceWindowManagerUI(i),
 			workspacessh.WithRemoteDataDir(filepath.Base(dataDir))),
@@ -602,21 +611,18 @@ func (i *IDE) init(
 	if err != nil {
 		return fmt.Errorf("register ssh scheme: %w", err)
 	}
-	err = workspaceManager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileSchemeFunc(op.hostDataDir, op.shellRCDir))
+	err = registerBuiltinScheme(workspaceManager, workspace.FileScheme,
+		fileSchemeFunc(op.hostDataDir, op.shellRCDir, vtescheme.ClientOptions{
+			DataDir: dataDir,
+			Command: op.workspaceServerCommand,
+		}))
 	if err != nil {
 		return fmt.Errorf("register file scheme: %w", err)
 	}
-	err = workspaceManager.RegisterScheme(workspace.MemoryScheme, workspace.NewMemoryScheme)
+	err = registerBuiltinScheme(workspaceManager,
+		workspace.MemoryScheme, workspace.NewMemoryScheme)
 	if err != nil {
 		return fmt.Errorf("register memory scheme: %w", err)
-	}
-
-	// register user-provided schemes via ide.WithScheme
-	for scheme, fn := range op.schemes {
-		if err := workspaceManager.RegisterScheme(scheme, fn); err != nil {
-			return fmt.Errorf("register %q scheme: %w", scheme, err)
-		}
 	}
 
 	homeDir, err := os.UserHomeDir()
@@ -818,4 +824,35 @@ func (i *IDE) initRunning() {
 func (i *IDE) startupIntro() (initShaderConfig, bool) {
 	intro := i.root.initShaderCfg
 	return intro, intro.shader != nil && i.playIntro
+}
+
+// fileSchemeFunc builds the production local scheme. Terminals are
+// hosted by a persistent workspace server so they survive Rune exiting;
+// there is deliberately no per-terminal fallback to a Rune-owned pty,
+// which would silently reintroduce terminals that die with the client.
+func fileSchemeFunc(
+	hostDataDir, shellRCDir string, opts vtescheme.ClientOptions,
+) schemeapi.SchemeFunc {
+	files := workspace.NewFileSchemeFunc(hostDataDir, shellRCDir)
+	return func(
+		ctx context.Context, cfg config.Config, uri workspaceapi.URI,
+	) (schemeapi.Scheme, error) {
+		inner, err := files(ctx, cfg, uri)
+		if err != nil {
+			return nil, err
+		}
+		return vtescheme.NewClient(ctx, inner, uri, opts), nil
+	}
+}
+
+// registerBuiltinScheme installs a scheme Rune ships, yielding to one
+// the caller registered under the same name.
+func registerBuiltinScheme(
+	m *workspace.Manager, scheme string, fn schemeapi.SchemeFunc,
+) error {
+	err := m.RegisterScheme(scheme, fn)
+	if errors.Is(err, schemeapi.ErrSchemeAlreadyRegistered) {
+		return nil
+	}
+	return err
 }

@@ -518,6 +518,8 @@ func runTUI(
 		ide.WithStreamingOpen(true),
 		ide.WithClipboard(text.NewAsyncSystemClipboard()),
 		ide.WithSystemURLOpener(func(u *url.URL) error { return extbrowser.Browse(u) }),
+		ide.WithWorkspaceServerCommand(workspaceServerCommand(
+			*flagDataPath, *flagConfigPath)),
 	}
 	opts = append(opts, embeddedTutorialOptions()...)
 	if debug.DebugBuild == "true" {

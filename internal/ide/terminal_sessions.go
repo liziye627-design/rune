@@ -27,61 +27,29 @@ import (
 
 	"github.com/unstablebuild/blue/iterator"
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
-	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
 	"github.com/unstablebuild/rune-go-sdk/api/textapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"unstable.build/rune/internal/browser"
+	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/ide/idehistory"
-	"unstable.build/rune/internal/term/vte"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
+	"unstable.build/rune/internal/workspace"
 )
-
-const (
-	terminalSessionDocumentKind   = "terminal-session"
-	terminalSessionDocumentPrefix = "terminal-sessions:"
-)
-
-type terminalSessionDocument struct {
-	Kind     string
-	Name     string
-	Snapshot vte.Snapshot
-}
-
-func normalizeTerminalSessionName(args []string) (string, error) {
-	name := strings.TrimSpace(strings.Join(args, " "))
-	if name == "" {
-		return "", errors.New("expected terminal session name")
-	}
-	return name, nil
-}
 
 func terminalSessionURI(name string) (workspaceapi.URI, error) {
 	return workspaceapi.ParseURI("terminalsession:///" + url.PathEscape(name))
 }
 
-func terminalSessionDocumentID(name string) string {
-	return terminalSessionDocumentPrefix + url.QueryEscape(name)
-}
-
-func (e *ex) terminalSessionStorage() storageapi.Service {
-	if e.terminalStorage == nil {
-		e.terminalStorage = storageapi.WithPartition(
-			e.storage, idehistory.TerminalStatePartition)
-	}
-	return e.terminalStorage
-}
-
-func (e *ex) terminalInFocus() (vtereservoir.VTE, bool) {
+func (e *ex) terminalInFocus() (workspace.VTE, bool) {
 	content, err := e.invokeWindow().Content()
 	if err != nil {
 		return nil, false
 	}
 
 	switch h := content.(type) {
-	case vtereservoir.VTE:
+	case workspace.VTE:
 		return h, true
 	case *browser.Tab:
-		if s, ok := h.Handler().(vtereservoir.VTE); ok {
+		if s, ok := h.Handler().(workspace.VTE); ok {
 			return s, true
 		}
 	}
@@ -89,206 +57,168 @@ func (e *ex) terminalInFocus() (vtereservoir.VTE, bool) {
 	return nil, false
 }
 
-func (e *ex) nextTerminalSessionName(ctx context.Context, h vtereservoir.VTE) (string, error) {
-	base := "terminal"
-	uri := h.URI()
-	if uri.Name() != "" {
-		base = uri.Name()
-	} else if uri.Path() != "" {
-		base = strings.Trim(strings.ReplaceAll(uri.Path(), "/", "-"), "-")
+// terminalAttachID reads the stable emulator identity a terminal
+// command was invoked with.
+func terminalAttachID(args []string) (workspace.VTEID, error) {
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		return "", errors.New("expected one terminal id")
 	}
-	if base == "" {
-		base = "terminal"
-	}
-
-	for i := 0; ; i++ {
-		name := base + "-saved"
-		if i != 0 {
-			name = fmt.Sprintf("%s-saved-%d", base, i)
-		}
-		ctx, cancel := context.WithTimeout(ctx, time.Second)
-		var doc terminalSessionDocument
-		err := e.terminalSessionStorage().Get(ctx, terminalSessionDocumentID(name), &doc)
-		cancel()
-		if errors.Is(err, storageapi.ErrNotFound) {
-			return name, nil
-		}
-		if err != nil {
-			return "", fmt.Errorf("check terminal session name %q: %w", name, err)
-		}
-	}
+	return workspace.VTEID(strings.TrimSpace(args[0])), nil
 }
 
-func (e *ex) saveTerminalSession(ctx context.Context, name string, h vtereservoir.VTE) error {
-	snapshot, err := h.Snapshot()
-	if err != nil {
-		return fmt.Errorf("snapshot terminal: %w", err)
-	}
-	if snapshot.Title == "" {
-		snapshot.Title = name
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	err = e.terminalSessionStorage().Set(ctx, terminalSessionDocumentID(name), terminalSessionDocument{
-		Kind:     terminalSessionDocumentKind,
-		Name:     name,
-		Snapshot: snapshot,
-	})
-	if err != nil {
-		return fmt.Errorf("save terminal session %q: %w", name, err)
-	}
-
-	_, _ = e.notifications.Notify(browserapi.LevelSuccess,
-		"terminal session %q saved", name)
-	return nil
-}
-
-func (e *ex) terminalsave(ctx context.Context, args ...string) error {
-	name, err := normalizeTerminalSessionName(args)
+// terminalattach binds this client to a terminal the workspace already
+// owns. The emulator keeps one canonical grid, so attaching from a
+// second client shows the same terminal rather than a copy of it.
+func (e *ex) terminalattach(_ context.Context, args ...string) error {
+	id, err := terminalAttachID(args)
 	if err != nil {
 		return err
 	}
+	h := newAsyncVTE(e, nil, func() (workspace.VTE, bool, error) {
+		v, err := e.attachVTE(id)
+		return v, false, err
+	})
+	if err := e.invokeWindow().SetContent(h); err != nil {
+		_ = h.Close()
+		return err
+	}
+	return nil
+}
+
+// terminaldetach releases this client's attachment to the focused
+// terminal. The emulator, its pty and its process keep running in the
+// workspace, so it can be attached again later or from elsewhere.
+func (e *ex) terminaldetach(_ context.Context, _ ...string) error {
+	if _, ok := e.terminalInFocus(); !ok {
+		return errors.New("not a terminal")
+	}
+	e.removeTerminalWindow()
+	return nil
+}
+
+// terminalclose terminates the focused terminal in the workspace that
+// owns it, taking its pty and process with it. Every other client
+// attached to the same emulator loses it too, which is what separates
+// this from terminaldetach.
+func (e *ex) terminalclose(_ context.Context, _ ...string) error {
 	h, ok := e.terminalInFocus()
 	if !ok {
 		return errors.New("not a terminal")
 	}
-	return e.saveTerminalSession(ctx, name, h)
+	if c, ok := h.(companionTerminalHandler); ok {
+		h = c.vth
+	}
+	id := h.ID()
+	if av, ok := h.(*asyncVTE); ok && id == "" {
+		// Still loading: there is nothing to terminate yet.
+		av.terminateOnArrival()
+	}
+	e.removeTerminalWindow()
+	if id != "" {
+		e.terminateVTE(id)
+	}
+	return nil
 }
 
-func (e *ex) terminalresume(ctx context.Context, args ...string) error {
-	name, err := normalizeTerminalSessionName(args)
-	if err != nil {
-		return err
+// removeTerminalWindow takes the terminal in focus out of its window,
+// letting go of this client's attachment to it. The companion terminal
+// outlives its window, so it is let go of explicitly: the next toggle
+// must open a new terminal rather than show one that is gone.
+func (e *ex) removeTerminalWindow() {
+	win := e.invokeWindow()
+	if win != e.companionTerminalWin {
+		e.comp.Browser().RemoveWindowContent(win)
+		return
 	}
+	e.companionTerminalWin.Close()
+	e.companionTerminalWin = nil
+	_ = e.companionTerminal.Close()
+	e.companionTerminal = nil
+}
 
-	ctx, cancel := context.WithTimeout(ctx, time.Second)
+// terminateVTE terminates the terminal id names without blocking the
+// event loop: the workspace may be a remote one whose transport is
+// slow, and the terminal is gone from this client's point of view
+// either way.
+func (e *ex) terminateVTE(id workspace.VTEID) {
+	ws := e.workspace
+	go debug.CapturePanicReport(func() {
+		if err := deleteVTE(ws, id); err != nil {
+			e.sched(func() {
+				_, _ = e.notifications.Notify(browserapi.LevelError,
+					"close terminal: %v", err)
+			})
+		}
+	})
+}
+
+// deleteVTE terminates the terminal id names in ws. It blocks on the
+// workspace. A terminal that is already gone counts as terminated.
+func deleteVTE(ws workspace.VTEOwner, id workspace.VTEID) error {
+	ctx, cancel := context.WithTimeout(
+		context.Background(), defaultVTESpawnTimeout)
 	defer cancel()
-	doc, err := e.loadTerminalSession(ctx, name)
-	if err != nil {
-		return fmt.Errorf("resume terminal session %q: %w", name, err)
+	err := ws.DeleteVTE(ctx, id)
+	if errors.Is(err, workspace.ErrVTENotFound) {
+		return nil
 	}
-	if doc.Name == "" {
-		doc.Name = name
-	}
-
-	_, err = e.restoreTerminalSessionTab(doc, e.invokeWindow())
 	return err
 }
 
-// loadTerminalSession reads a saved session. Sessions saved before they
-// had their own partition still live beside the workspace state, where
-// every startup listing decodes them; a hit there moves the document.
-func (e *ex) loadTerminalSession(
-	ctx context.Context, name string,
-) (terminalSessionDocument, error) {
-	id := terminalSessionDocumentID(name)
-	var doc terminalSessionDocument
-	err := e.terminalSessionStorage().Get(ctx, id, &doc)
-	if !errors.Is(err, storageapi.ErrNotFound) {
-		return doc, err
-	}
-	if err := e.storage.Get(ctx, id, &doc); err != nil {
-		return doc, err
-	}
-	if doc.Kind == "" {
-		doc.Kind = terminalSessionDocumentKind
-	}
-	if err := e.terminalSessionStorage().Set(ctx, id, doc); err == nil {
-		_ = e.storage.Delete(ctx, id)
-	}
-	return doc, nil
-}
-
-func (e *ex) newTerminalSessionHandler(
-	name string, snapshot vte.Snapshot,
-) (vtereservoir.VTE, error) {
-	h, err := e.newEmulatorHandler(nil)
-	if err != nil {
-		return nil, err
-	}
-	if err := h.RestoreFromSnapshot(snapshot); err != nil {
-		_ = h.Close()
-		return nil, fmt.Errorf("restore terminal session %q: %w", name, err)
-	}
-	return h, nil
-}
-
-func (e *ex) restoreTerminalSessionTab(
-	doc terminalSessionDocument, win browser.Window,
-) (*browser.Tab, error) {
-	if doc.Name == "" {
-		return nil, errors.New("terminal session document missing name")
-	}
-
-	uri, err := terminalSessionURI(doc.Name)
-	if err != nil {
-		return nil, err
-	}
-	if existing, ok := e.comp.Resource(uri); ok {
-		if win != nil {
-			if err := win.SetContent(existing); err != nil {
-				return nil, err
+// attachOrRestoreTerminal reattaches the emulator a persisted session
+// names, so a terminal that outlived Rune comes back live rather than
+// as a picture of itself.
+//
+// A replacement is built only once the workspace has confirmed the
+// emulator is gone. A transport failure, an auth failure or a timeout
+// must surface instead: replacing on those would silently strand a
+// terminal that is still running and hand the user a dead snapshot.
+func (e *ex) attachOrRestoreTerminal(
+	doc idehistory.TerminalSession,
+) workspace.VTE {
+	av := newAsyncVTE(e, doc.CommandAndArgs, func() (workspace.VTE, bool, error) {
+		if doc.VTEID != "" {
+			v, err := e.attachVTE(doc.VTEID)
+			if err == nil {
+				return v, false, nil
+			}
+			if !errors.Is(err, workspace.ErrVTENotFound) {
+				return nil, false, fmt.Errorf(
+					"attach terminal session %q: %w", doc.Name, err)
 			}
 		}
-		tab, ok := existing.(*browser.Tab)
-		if !ok {
-			return nil, fmt.Errorf("terminal session %q resource is not a tab", doc.Name)
+		v, err := e.createVTE(doc.CommandAndArgs)
+		if err != nil {
+			return nil, false, err
 		}
-		return tab, nil
-	}
-
-	h, err := e.newTerminalSessionHandler(doc.Name, doc.Snapshot)
-	if err != nil {
-		return nil, err
-	}
-	title := doc.Name
-	if doc.Snapshot.Title != "" {
-		title = doc.Snapshot.Title
-	}
-	t, err := e.comp.Tab(uri, e.config.Icons.Terminal, title, h)
-	if err != nil {
-		_ = h.Close()
-		return nil, fmt.Errorf("wm.Tab: %w", err)
-	}
-	// Route dynamic title updates issued under the handler's own URI
-	// to this session-keyed tab.
-	e.tabAliases.addAlias(h.URI(), uri)
-	tab := t.(*browser.Tab)
-	tab.Subscribe((*tabSubscriber)(e))
-	if win != nil {
-		if err := win.SetContent(t); err != nil {
-			_ = t.Close()
-			return nil, err
+		if err := v.RestoreFromSnapshot(doc.Snapshot); err != nil {
+			id := v.ID()
+			_ = v.Close()
+			_ = deleteVTE(e.workspace, id)
+			return nil, false, fmt.Errorf(
+				"restore terminal session %q: %w", doc.Name, err)
 		}
-	}
-	return tab, nil
+		return v, true, nil
+	})
+	av.standIn = &doc
+	return av
 }
 
-func (e *ex) completeTerminalSessions(ctx context.Context, _ textapi.Command) (
+// completeAttachableTerminals lists the emulators the workspace owns so
+// terminalattach can be completed by identity.
+func (e *ex) completeAttachableTerminals(ctx context.Context, _ textapi.Command) (
 	iterator.Iterator[string], string, error,
 ) {
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	it, err := e.terminalSessionStorage().List(ctx, []storageapi.Filter{{
-		Field: storageapi.Field{FieldPath: []string{"Kind"}, Value: terminalSessionDocumentKind},
-		Op:    storageapi.OpEqual,
-	}})
+	infos, err := e.workspace.ListVTEs(ctx)
 	if err != nil {
 		return nil, "", err
 	}
-	defer it.Close()
-
-	var names []string
-	for it.HasNext() {
-		var doc terminalSessionDocument
-		if err := it.NextTo(&doc); err != nil {
-			return nil, "", err
-		}
-		if doc.Name != "" {
-			names = append(names, doc.Name)
-		}
+	ids := make([]string, 0, len(infos))
+	for _, info := range infos {
+		ids = append(ids, string(info.ID))
 	}
-	sort.Strings(names)
-	return iterator.FromSlice(names), "", nil
+	sort.Strings(ids)
+	return iterator.FromSlice(ids), "", nil
 }

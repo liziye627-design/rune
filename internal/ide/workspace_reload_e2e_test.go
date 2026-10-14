@@ -35,7 +35,7 @@ import (
 	"unstable.build/rune/internal/browser"
 	tcomponent "unstable.build/rune/internal/component"
 	"unstable.build/rune/internal/ide/idepkg/pkgtrust"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
+	"unstable.build/rune/internal/workspace"
 )
 
 func TestE2EWorkspaceReloadRestoresLayoutAndTerminalOutput(t *testing.T) {
@@ -73,6 +73,8 @@ workspace:
 		WithLocker(mu),
 		WithScheduleNextTick(scheduleNextTick),
 		WithPublishEvent(func(term.Event) bool { return true }),
+		WithScheme(workspace.FileScheme,
+			terminalSchemeFunc(workspace.NewFileScheme)),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = i.Close() })
@@ -127,7 +129,7 @@ workspace:
 			if cerr != nil {
 				return
 			}
-			vte, isVTE := content.(vtereservoir.VTE)
+			vte, isVTE := content.(workspace.VTE)
 			if !isVTE {
 				return
 			}

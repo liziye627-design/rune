@@ -27,17 +27,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
+	"github.com/unstablebuild/rune-go-sdk/clipboard"
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"unstable.build/rune/internal/component/shader/shaderutils"
 	"unstable.build/rune/internal/handler/handlertest"
+	"unstable.build/rune/internal/ide/idehistory"
 	"unstable.build/rune/internal/term/vte"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
 	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/text/emacs"
 	"unstable.build/rune/internal/text/helix"
 	"unstable.build/rune/internal/text/standard"
 	"unstable.build/rune/internal/text/texttest"
 	"unstable.build/rune/internal/text/vi"
+	"unstable.build/rune/internal/workspace"
 )
 
 // exitingVTE is a terminal whose process already exited with exitErr.
@@ -74,14 +76,16 @@ func (v *exitingVTE) SeekOffset() int {
 	return max(0, len(v.screen.rows)-v.height-v.screen.scrolledBack)
 }
 
-func (v *exitingVTE) Snapshot() (vte.Snapshot, error) {
+func (v *exitingVTE) Snapshot() (workspace.VTESnapshot, error) {
 	cells := make([][]term.Cell, len(v.screen.rows))
 	for y, line := range v.screen.rows {
 		for _, r := range line {
 			cells[y] = append(cells[y], term.NewCell(r, 1, term.Attributes{Fg: v.fg}))
 		}
 	}
-	return vte.Snapshot{Schema: 1, Primary: vte.ScreenSnapshot{Cells: cells}}, nil
+	return workspace.VTESnapshot{
+		Schema: 1, Primary: workspace.VTEScreenSnapshot{Cells: cells},
+	}, nil
 }
 
 func (v *exitingVTE) Handle(term.Event) (bool, bool) { return true, false }
@@ -134,25 +138,53 @@ type terminalExitHarness struct {
 	av       *asyncVTE
 }
 
+// exitHarnessWorkspace hands out the harness terminal both to a fresh
+// terminal and to the saved session that names it.
+type exitHarnessWorkspace struct {
+	*testLoader
+	terminal *exitingVTE
+}
+
+func (w *exitHarnessWorkspace) CreateVTE(
+	context.Context, workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	return w.terminal, nil
+}
+
+func (w *exitHarnessWorkspace) AttachVTE(
+	_ context.Context, id workspace.VTEID,
+) (workspace.VTE, error) {
+	if id != w.terminal.ID() {
+		return nil, workspace.ErrVTENotFound
+	}
+	return w.terminal, nil
+}
+
 // newTerminalExitHarness builds an ex editing with ed whose next
 // terminal is a process that left screen and exited with exitErr.
 func newTerminalExitHarness(
 	t *testing.T, ed text.Editor, screen terminalScreen, exitErr error,
 ) *terminalExitHarness {
 	t.Helper()
-	h := &terminalExitHarness{testEx: newExForTesting(t, ed)}
-	t.Cleanup(func() { _ = h.Close() })
-	h.terminal = &exitingVTE{
+	terminal := &exitingVTE{
 		testVte: newTestVte(),
 		exitErr: exitErr,
 		screen:  screen,
 		fg:      term.ColorGreen,
 	}
-	h.terminal.uri = mustURI(t, "file:///dev/ttys077")
-	h.terminal.title = "make"
-	h.ex.newEmulatorHandler = func([]string) (vtereservoir.VTE, error) {
-		h.av = newAsyncVTE(h.ex, func() (vtereservoir.VTE, error) {
-			return h.terminal, nil
+	terminal.uri = mustURI(t, "file:///dev/ttys077")
+	terminal.title = "make"
+	terminal.id = workspace.NewVTEID()
+	h := &terminalExitHarness{
+		testEx: newExForTestingWithWorkspace(t,
+			&exitHarnessWorkspace{testLoader: &testLoader{}, terminal: terminal},
+			ed, vte.DefaultConfig(), nopPublishEvent, clipboard.NewInMemory()),
+		terminal: terminal,
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	h.ex.newEmulatorHandler = func(args []string) (workspace.VTE, error) {
+		h.av = newAsyncVTE(h.ex, args, func() (workspace.VTE, bool, error) {
+			return h.terminal, true, nil
 		})
 		return h.av, nil
 	}
@@ -205,16 +237,30 @@ func TestTerminalTabExit(t *testing.T) {
 		require.NoError(t, h.ex.terminalnew(context.Background(), "make"))
 		return h.av.URI()
 	}
-	openSession := func(t *testing.T, h *terminalExitHarness) workspaceapi.URI {
-		doc := terminalSessionDocument{
-			Name:     "build",
-			Snapshot: vte.Snapshot{Schema: 1, Title: "build"},
+	// A saved session comes back attached to the terminal it names when
+	// that terminal is still running, and restored from its snapshot in
+	// a new one otherwise.
+	openSession := func(attach bool) terminalOpener {
+		return func(t *testing.T, h *terminalExitHarness) workspaceapi.URI {
+			doc := idehistory.TerminalSession{
+				Name:     "build",
+				Tab:      true,
+				Visible:  true,
+				Snapshot: vte.Snapshot{Schema: 1, Title: "build"},
+			}
+			if attach {
+				doc.VTEID = h.terminal.ID()
+			}
+			_, err := restoreOpenTerminalSessionSequential(h.ex, doc, nil)
+			require.NoError(t, err)
+			uri, err := terminalSessionURI(doc.Name)
+			require.NoError(t, err)
+			tab, ok := h.comp.Browser().Tab(uri)
+			require.True(t, ok)
+			h.av, ok = tab.Handler().(*asyncVTE)
+			require.True(t, ok)
+			return uri
 		}
-		_, err := h.ex.restoreTerminalSessionTab(doc, h.ex.invokeWindow())
-		require.NoError(t, err)
-		uri, err := terminalSessionURI(doc.Name)
-		require.NoError(t, err)
-		return uri
 	}
 	openBackgroundTab := func(t *testing.T, h *terminalExitHarness) workspaceapi.URI {
 		uri := openTab(t, h)
@@ -440,8 +486,16 @@ func TestTerminalTabExit(t *testing.T) {
 		{
 			desc:     "failed restored session tab",
 			exitErr:  failure,
-			open:     openSession,
+			open:     openSession(false),
 			exits:    []terminalExit{ptyClosed, wokenUp},
+			wantKept: true,
+			frames:   keptFrames,
+		},
+		{
+			desc:     "failed attached session tab",
+			exitErr:  failure,
+			open:     openSession(true),
+			exits:    []terminalExit{ptyClosed},
 			wantKept: true,
 			frames:   keptFrames,
 		},
@@ -526,8 +580,14 @@ func TestTerminalTabExit(t *testing.T) {
 		},
 		{
 			desc:   "clean restored session tab",
-			open:   openSession,
+			open:   openSession(false),
 			exits:  []terminalExit{ptyClosed},
+			frames: droppedFrames,
+		},
+		{
+			desc:   "clean attached session tab",
+			open:   openSession(true),
+			exits:  []terminalExit{wokenUp},
 			frames: droppedFrames,
 		},
 		{
@@ -580,9 +640,9 @@ func TestTerminalTabExit(t *testing.T) {
 			if kept {
 				_, isEditor := tab.Handler().(text.Handler)
 				assert.True(t, isEditor, "a failed tab must be left with an editor")
-				_, isTerminal := tab.Handler().(vtereservoir.VTE)
+				_, isTerminal := tab.Handler().(workspace.VTE)
 				assert.False(t, isTerminal,
-					"a dead tab must not be saved or resumed as a terminal session")
+					"a dead tab must not be detached or attached as a terminal")
 				assertTabIconColor(t, h.testEx, width, height, term.ColorRed)
 			}
 			if tc.gray != "" {

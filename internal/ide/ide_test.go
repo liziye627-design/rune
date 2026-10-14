@@ -76,10 +76,10 @@ import (
 	"unstable.build/rune/internal/ide/vctrl"
 	"unstable.build/rune/internal/localstorage"
 	"unstable.build/rune/internal/term/vte"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
 	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/text/texttest"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
 )
 
 func TestIDEInitializationIntegration(t *testing.T) {
@@ -1702,6 +1702,23 @@ command:
 			"extensionready queue must preserve submission order")
 }
 
+// terminalSchemeFunc hosts a workspace's terminals in this process and
+// attaches to them over the same protocol production uses, so tests
+// exercise the real client emulator rather than a shortcut. Production
+// hands the terminals to a persistent rune workspace server, which a
+// test binary is not.
+func terminalSchemeFunc(fn schemeapi.SchemeFunc) schemeapi.SchemeFunc {
+	return func(
+		ctx context.Context, cfg config.Config, uri workspaceapi.URI,
+	) (schemeapi.Scheme, error) {
+		inner, err := fn(ctx, cfg, uri)
+		if err != nil {
+			return nil, err
+		}
+		return vtescheme.NewLoopback(inner), nil
+	}
+}
+
 func TestE2EWorkspaceCloseThenQuit(t *testing.T) {
 	homeDir := t.TempDir()
 	// The second workspace must be a child of the home workspace so
@@ -2060,6 +2077,8 @@ command:
 		WithLocker(mu),
 		WithScheduleNextTick(scheduleNextTick),
 		WithPublishEvent(func(term.Event) bool { return true }),
+		WithScheme(workspace.FileScheme,
+			terminalSchemeFunc(workspace.NewFileScheme)),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = i.Close() })
@@ -2099,7 +2118,7 @@ command:
 			if err != nil {
 				return
 			}
-			vte, isVTE := content.(vtereservoir.VTE)
+			vte, isVTE := content.(workspace.VTE)
 			if !isVTE {
 				return
 			}
@@ -2159,6 +2178,8 @@ command:
 		WithLocker(mu),
 		WithScheduleNextTick(scheduleNextTick),
 		WithPublishEvent(func(term.Event) bool { return true }),
+		WithScheme(workspace.FileScheme,
+			terminalSchemeFunc(workspace.NewFileScheme)),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = i.Close() })
@@ -2204,7 +2225,7 @@ command:
 			if err != nil {
 				return
 			}
-			emulator, isVTE := content.(vtereservoir.VTE)
+			emulator, isVTE := content.(workspace.VTE)
 			if !isVTE {
 				return
 			}
@@ -2259,6 +2280,8 @@ command:
 		WithLocker(mu),
 		WithScheduleNextTick(scheduleNextTick),
 		WithPublishEvent(func(term.Event) bool { return true }),
+		WithScheme(workspace.FileScheme,
+			terminalSchemeFunc(workspace.NewFileScheme)),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = i.Close() })
@@ -2312,7 +2335,7 @@ command:
 			if err != nil {
 				return
 			}
-			emulator, isVTE := content.(vtereservoir.VTE)
+			emulator, isVTE := content.(workspace.VTE)
 			if !isVTE {
 				return
 			}
@@ -4216,6 +4239,35 @@ func TestConsoleMouseSelectionOutputAfterInputBandClick(t *testing.T) {
 			sel, ok := b.Selection()
 			require.True(t, ok, "output drag after an input-band click must select")
 			assert.Equal(t, "alpha bravo", sel)
+		})
+	}
+}
+
+func TestRegisterBuiltinSchemeYieldsToTheCaller(t *testing.T) {
+	schemeNamed := func(name string) schemeapi.SchemeFunc {
+		return func(context.Context, config.Config, workspaceapi.URI) (schemeapi.Scheme, error) {
+			return nil, errors.New(name)
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		registered schemeapi.SchemeFunc
+		want       string
+	}{
+		{name: "installs the built-in", want: "built-in"},
+		{name: "keeps the caller's scheme", registered: schemeNamed("caller"), want: "caller"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := workspace.NewManager(config.NopConfig(), inlineSchedule)
+			if tc.registered != nil {
+				require.NoError(t, m.RegisterScheme("test", tc.registered))
+			}
+			require.NoError(t, registerBuiltinScheme(m, "test", schemeNamed("built-in")))
+
+			fn, err := m.Scheme(mustURI(t, "test:///ws"))
+			require.NoError(t, err)
+			_, err = fn(context.Background(), config.NopConfig(), mustURI(t, "test:///ws"))
+			assert.EqualError(t, err, tc.want)
 		})
 	}
 }

@@ -30,9 +30,9 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/handler/handlertest"
+	"unstable.build/rune/internal/ide/idehistory"
 	"unstable.build/rune/internal/term/programstatus"
 	"unstable.build/rune/internal/term/vte"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
 	"unstable.build/rune/internal/text/texttest"
 	"unstable.build/rune/internal/workspace"
 )
@@ -114,9 +114,9 @@ func TestAsyncVTE(t *testing.T) {
 
 		release := make(chan struct{})
 		tv := newTestVte()
-		av := newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
+		av := newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
 			<-release
-			return tv, nil
+			return tv, true, nil
 		})
 
 		assert.False(t, av.IsComplete())
@@ -144,9 +144,9 @@ func TestAsyncVTE(t *testing.T) {
 
 		release := make(chan struct{})
 		rv := &replayVTE{testVte: newTestVte()}
-		av := newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
+		av := newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
 			<-release
-			return rv, nil
+			return rv, true, nil
 		})
 
 		av.Resize(42, 17)
@@ -194,9 +194,9 @@ func TestAsyncVTE(t *testing.T) {
 
 		release := make(chan struct{})
 		rv := &replayVTE{testVte: newTestVte()}
-		av := newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
+		av := newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
 			<-release
-			return rv, nil
+			return rv, true, nil
 		})
 
 		// The WM lays out the placeholder at the pane dimensions before
@@ -229,9 +229,9 @@ func TestAsyncVTE(t *testing.T) {
 
 		release := make(chan struct{})
 		tv := newTestVte()
-		av := newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
+		av := newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
 			<-release
-			return tv, nil
+			return tv, true, nil
 		})
 
 		require.NoError(t, b.ex.tm.SetTabStatus(tv.URI(), programstatus.Report{
@@ -262,8 +262,8 @@ func TestAsyncVTE(t *testing.T) {
 		rec := &recordingNotifications{inner: b.ex.notifications}
 		b.ex.notifications = rec
 
-		av := newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
-			return nil, errors.New("stalled transport")
+		av := newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
+			return nil, false, errors.New("stalled transport")
 		})
 		av.Resize(40, 3)
 
@@ -287,9 +287,9 @@ func TestAsyncVTE(t *testing.T) {
 		defer b.Close()
 
 		release := make(chan struct{})
-		av := newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
+		av := newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
 			<-release
-			return newTestVte(), nil
+			return newTestVte(), true, nil
 		})
 		defer func() {
 			close(release)
@@ -581,7 +581,7 @@ func TestAsyncVTETabNameAliasing(t *testing.T) {
 					require.NoError(t, err)
 					tv := newTestVte()
 					tv.uri = pty
-					av.complete(tv, nil)
+					av.complete(tv, true, nil)
 					if closeBeforeReplay {
 						require.NoError(t, tab.Close())
 					} else {
@@ -611,9 +611,9 @@ func TestAsyncVTETabNameAliasing(t *testing.T) {
 		tv := newTestVte()
 		tv.uri = mustURI("file:///dev/ttys042")
 		tv.title = "vim"
-		av := newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
+		av := newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
 			<-release
-			return tv, nil
+			return tv, true, nil
 		})
 		tab, err := b.comp.Tab(av.URI(), 'x', av.Title(), av)
 		require.NoError(t, err)
@@ -668,18 +668,20 @@ func TestAsyncVTETabNameAliasing(t *testing.T) {
 		tv := newTestVte()
 		tv.uri = mustURI("file:///dev/ttys043")
 		tv.title = "vim"
-		b.ex.newEmulatorHandler = func([]string) (vtereservoir.VTE, error) {
-			return newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
+		b.ex.newEmulatorHandler = func([]string) (workspace.VTE, error) {
+			return newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
 				<-release
-				return tv, nil
+				return tv, true, nil
 			}), nil
 		}
 
-		doc := terminalSessionDocument{
+		doc := idehistory.TerminalSession{
 			Name:     "build",
 			Snapshot: vte.Snapshot{Schema: 1, Title: "saved"},
 		}
-		tab, err := b.ex.restoreTerminalSessionTab(doc, nil)
+		h, err := b.ex.newEmulatorHandler(nil)
+		require.NoError(t, err)
+		tab, err := newTerminalSessionTabFromState(b.ex, doc, h)
 		require.NoError(t, err)
 		sessionURI, err := terminalSessionURI(doc.Name)
 		require.NoError(t, err)
@@ -712,8 +714,8 @@ func TestAsyncVTETabNameAliasing(t *testing.T) {
 
 		tv := newTestVte()
 		tv.uri = mustURI("file:///dev/ttys044")
-		av := newAsyncVTE(b.ex, func() (vtereservoir.VTE, error) {
-			return tv, nil
+		av := newAsyncVTE(b.ex, nil, func() (workspace.VTE, bool, error) {
+			return tv, true, nil
 		})
 		_, err := b.comp.Tab(av.URI(), 'x', av.Title(), av)
 		require.NoError(t, err)

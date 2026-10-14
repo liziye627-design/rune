@@ -26,7 +26,6 @@ import (
 	tcomponent "unstable.build/rune/internal/component"
 	"unstable.build/rune/internal/ide/idehistory"
 	"unstable.build/rune/internal/ide/idetask"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
 	"unstable.build/rune/internal/workspace"
 )
 
@@ -54,7 +53,7 @@ func (s exSnapshotter) Terminals() []idehistory.TerminalSession {
 	tabs, terminals := openTerminalSessionWindowsForState(e)
 	var ret []idehistory.TerminalSession
 	for _, tab := range e.comp.Tabs() {
-		terminal, ok := tab.Handler().(vtereservoir.VTE)
+		terminal, ok := tab.Handler().(workspace.VTE)
 		if !ok {
 			continue
 		}
@@ -70,12 +69,14 @@ func (s exSnapshotter) Terminals() []idehistory.TerminalSession {
 			snap.Title = openTerminalSessionTitle(e, tab, terminal, "")
 		}
 		ret = append(ret, idehistory.TerminalSession{
-			Name:     "", // auto-generated at restore time
-			Snapshot: snap,
-			Tab:      window.tab,
-			Visible:  window.visible,
-			Focus:    window.focus,
-			WindowID: window.windowID,
+			Name:           "", // auto-generated at restore time
+			VTEID:          terminal.ID(),
+			CommandAndArgs: terminalCommandAndArgs(terminal),
+			Snapshot:       snap,
+			Tab:            window.tab,
+			Visible:        window.visible,
+			Focus:          window.focus,
+			WindowID:       window.windowID,
 		})
 	}
 	for _, win := range terminals {
@@ -87,14 +88,27 @@ func (s exSnapshotter) Terminals() []idehistory.TerminalSession {
 			snap.Title = openTerminalSessionTitle(e, nil, win.terminal, "")
 		}
 		ret = append(ret, idehistory.TerminalSession{
-			Snapshot: snap,
-			Tab:      win.window.tab,
-			Visible:  win.window.visible,
-			Focus:    win.window.focus,
-			WindowID: win.window.windowID,
+			VTEID:          win.terminal.ID(),
+			CommandAndArgs: terminalCommandAndArgs(win.terminal),
+			Snapshot:       snap,
+			Tab:            win.window.tab,
+			Visible:        win.window.visible,
+			Focus:          win.window.focus,
+			WindowID:       win.window.windowID,
 		})
 	}
 	return ret
+}
+
+// terminalCommandAndArgs recovers what a terminal was opened with. An
+// empty result means the configured shell, which is also what an empty
+// CreateVTE intent means.
+func terminalCommandAndArgs(v workspace.VTE) []string {
+	av, ok := v.(*asyncVTE)
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), av.cmdAndArgs...)
 }
 
 // Tasks snapshots every running task in the ex.
@@ -185,7 +199,7 @@ type openTerminalWindow struct {
 }
 
 type openTerminalWindowTerminal struct {
-	terminal vtereservoir.VTE
+	terminal workspace.VTE
 	window   openTerminalWindow
 }
 
@@ -209,13 +223,13 @@ func openTerminalSessionWindowsForState(e *ex) (
 			windowID: win.WindowID(),
 		}
 		if tab, ok := content.(*browser.Tab); ok {
-			if _, ok := tab.Handler().(vtereservoir.VTE); ok {
+			if _, ok := tab.Handler().(workspace.VTE); ok {
 				window.tab = true
 				tabs[tab] = window
 			}
 			return
 		}
-		terminal, ok := content.(vtereservoir.VTE)
+		terminal, ok := content.(workspace.VTE)
 		if !ok {
 			return
 		}
@@ -230,7 +244,7 @@ func openTerminalSessionWindowsForState(e *ex) (
 func openTerminalSessionTitle(
 	e *ex,
 	tab *browser.Tab,
-	terminal vtereservoir.VTE,
+	terminal workspace.VTE,
 	fallback string,
 ) string {
 	if tab != nil {
@@ -371,10 +385,7 @@ func restoreOpenTerminalSessionSequential(
 func newTerminalSessionContentFromState(
 	e *ex, doc idehistory.TerminalSession,
 ) (browserapi.Handler, error) {
-	h, err := e.newTerminalSessionHandler(doc.Name, doc.Snapshot)
-	if err != nil {
-		return nil, err
-	}
+	h := e.attachOrRestoreTerminal(doc)
 	if !doc.Tab {
 		return h, nil
 	}
@@ -386,7 +397,7 @@ func newTerminalSessionContentFromState(
 }
 
 func newTerminalSessionTabFromState(
-	e *ex, doc idehistory.TerminalSession, h vtereservoir.VTE,
+	e *ex, doc idehistory.TerminalSession, h workspace.VTE,
 ) (*browser.Tab, error) {
 	uri, err := terminalSessionURI(doc.Name)
 	if err != nil {

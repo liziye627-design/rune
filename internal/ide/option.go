@@ -154,8 +154,8 @@ func WithExtension(p Extension) Option {
 // workspace.Manager. The given fn is invoked to construct the scheme
 // when a workspace with a URI of the given scheme is opened.
 //
-// Registering a scheme name that is already in use causes IDE
-// initialization to fail with an error.
+// A scheme registered here takes precedence over the built-in scheme
+// of the same name.
 func WithScheme(scheme string, fn schemeapi.SchemeFunc) Option {
 	return func(opts *options) {
 		if opts.schemes == nil {
@@ -181,6 +181,18 @@ func WithShellRCDir(dir string) Option {
 func WithHostDataDir(dir string) Option {
 	return func(opts *options) {
 		opts.hostDataDir = dir
+	}
+}
+
+// WithWorkspaceServerCommand is the program and arguments that start
+// this machine's workspace server when none is running. Local
+// terminals live in that server so they outlive this process; without
+// it they are only reachable while a server someone else started is
+// running, because a host that guessed the binary would hand them to
+// whatever happens to be running.
+func WithWorkspaceServerCommand(command []string) Option {
+	return func(opts *options) {
+		opts.workspaceServerCommand = command
 	}
 }
 
@@ -540,36 +552,37 @@ func WithoutSessionReopen() Option {
 }
 
 type options struct {
-	publishEvent         EventPublisher
-	extensionRunner      ExtensionsRunner
-	releaseManager       release.Manager
-	tabBarOffset         int
-	rightInset           int
-	tabsClickCallback    func(int) bool
-	tabBarHeight         int
-	workspacesBarFrame   bool
-	workspacesBarHeight  int
-	workspacesIcon       rune
-	workspacesBarOffset  int
-	locker               sync.Locker
-	dispatchOnPreview    map[string]previewFunc
-	extensions           map[string]Extension
-	schemes              map[string]schemeapi.SchemeFunc
-	shellRCDir           string
-	hostDataDir          string
-	workspaceConfig      string
-	logos                map[string]Logo
-	fallbackLogo         *Logo
-	defaultConfig        string
-	bell                 func()
-	scheduleFn           func(func()) bool
-	cellPixelSize        func() (int, int)
-	clip                 clipboard.Register
-	systemOpenURL        func(*url.URL) error
-	afterFunc            func(time.Duration, func()) *time.Timer
-	debugCommands        bool
-	streamingOpen        bool
-	disableSessionReopen bool
+	publishEvent           EventPublisher
+	extensionRunner        ExtensionsRunner
+	releaseManager         release.Manager
+	tabBarOffset           int
+	rightInset             int
+	tabsClickCallback      func(int) bool
+	tabBarHeight           int
+	workspacesBarFrame     bool
+	workspacesBarHeight    int
+	workspacesIcon         rune
+	workspacesBarOffset    int
+	locker                 sync.Locker
+	dispatchOnPreview      map[string]previewFunc
+	extensions             map[string]Extension
+	schemes                map[string]schemeapi.SchemeFunc
+	shellRCDir             string
+	hostDataDir            string
+	workspaceServerCommand []string
+	workspaceConfig        string
+	logos                  map[string]Logo
+	fallbackLogo           *Logo
+	defaultConfig          string
+	bell                   func()
+	scheduleFn             func(func()) bool
+	cellPixelSize          func() (int, int)
+	clip                   clipboard.Register
+	systemOpenURL          func(*url.URL) error
+	afterFunc              func(time.Duration, func()) *time.Timer
+	debugCommands          bool
+	streamingOpen          bool
+	disableSessionReopen   bool
 
 	workspaceOpenCompleters map[string]command.Completer
 

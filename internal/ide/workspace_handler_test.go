@@ -75,10 +75,10 @@ import (
 	"unstable.build/rune/internal/ide/vctrl/testgit"
 	"unstable.build/rune/internal/localstorage"
 	"unstable.build/rune/internal/term/programstatus"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
 	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/text/textrpc"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
 	"unstable.build/rune/internal/workspace/workspacetest"
 )
 
@@ -712,7 +712,7 @@ func TestSetTabNameWithAttrIntegration(t *testing.T) {
 	ptys := new(bellPtyState)
 	const bellScheme = "bellpty"
 	require.NoError(t, manager.RegisterScheme(bellScheme,
-		func(ctx context.Context, cfg config.Config, uri workspaceapi.URI) (
+		terminalSchemeFunc(func(ctx context.Context, cfg config.Config, uri workspaceapi.URI) (
 			schemeapi.Scheme, error,
 		) {
 			base, err := newTerminalSessionTestScheme(ctx, cfg, uri)
@@ -720,7 +720,7 @@ func TestSetTabNameWithAttrIntegration(t *testing.T) {
 				return nil, err
 			}
 			return &bellPtyScheme{Scheme: base, state: ptys}, nil
-		}))
+		})))
 
 	bootURI, err := workspaceapi.ParseURI("memory://" + dir)
 	require.NoError(t, err)
@@ -3053,7 +3053,8 @@ func TestWorkspaceExtensions(t *testing.T) {
 		mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 		manager := workspace.NewManager(cfg.workspace(), sched)
 
-		manager.RegisterScheme(workspace.MemoryScheme, workspace.NewMemoryScheme)
+		manager.RegisterScheme(workspace.MemoryScheme,
+			terminalSchemeFunc(workspace.NewMemoryScheme))
 
 		uri, err := workspaceapi.ParseURI("memory:///tmp")
 		require.NoError(t, err)
@@ -3116,7 +3117,8 @@ func TestWorkspaceExtensions(t *testing.T) {
 		mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 		manager := workspace.NewManager(cfg.workspace(), sched)
 
-		manager.RegisterScheme(workspace.MemoryScheme, workspace.NewMemoryScheme)
+		manager.RegisterScheme(workspace.MemoryScheme,
+			terminalSchemeFunc(workspace.NewMemoryScheme))
 
 		uri, err := workspaceapi.ParseURI("memory:///tmp")
 		require.NoError(t, err)
@@ -3874,7 +3876,7 @@ func TestWorkspaceManagerHandlerDrawWithInitialFiles(t *testing.T) {
 				sched, drain := newTestScheduler(t, mu)
 				manager := workspace.NewManager(config.NopConfig(), sched)
 				require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-					workspace.NewMemoryScheme))
+					terminalSchemeFunc(workspace.NewMemoryScheme)))
 				uri, err := workspaceapi.ParseURI(fmt.Sprintf("memory:///%s", dir))
 				require.NoError(t, err)
 				runner := FuncExtensionsRunner(testRunnerFn)
@@ -4048,7 +4050,7 @@ func TestWorkspaceManagerRestoresOpenTerminalSessions(t *testing.T) {
 		mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 		manager := workspace.NewManager(config.NopConfig(), sched)
 		require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-			workspace.NewMemoryScheme))
+			terminalSchemeFunc(workspace.NewMemoryScheme)))
 		const terminalWorkspaceScheme = "terminaltest"
 		require.NoError(t, manager.RegisterScheme(terminalWorkspaceScheme,
 			func(ctx context.Context, cfg config.Config, uri workspaceapi.URI) (schemeapi.Scheme, error) {
@@ -4087,7 +4089,7 @@ func TestWorkspaceManagerRestoresOpenTerminalSessions(t *testing.T) {
 		require.Len(t, tabs, 2)
 		var terminalTabs int
 		for _, tab := range tabs {
-			if _, ok := tab.Handler().(vtereservoir.VTE); ok {
+			if _, ok := tab.Handler().(workspace.VTE); ok {
 				terminalTabs++
 			}
 		}
@@ -4099,11 +4101,11 @@ func TestWorkspaceManagerRestoresOpenTerminalSessions(t *testing.T) {
 			content, err := win.Content()
 			require.NoError(t, err)
 			switch content := content.(type) {
-			case vtereservoir.VTE:
+			case workspace.VTE:
 				ephemeralTerminalWindows++
 				terminalWindows++
 			case *browser.Tab:
-				if _, ok := content.Handler().(vtereservoir.VTE); ok {
+				if _, ok := content.Handler().(workspace.VTE); ok {
 					tabTerminalWindows++
 					terminalWindows++
 				} else if _, ok := content.Handler().(text.Handler); ok {
@@ -4206,7 +4208,7 @@ func TestWorkspaceManagerRestoresOpenTerminalSessions(t *testing.T) {
 		mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 		manager := workspace.NewManager(config.NopConfig(), sched)
 		require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-			workspace.NewMemoryScheme))
+			terminalSchemeFunc(workspace.NewMemoryScheme)))
 		const terminalWorkspaceScheme = "terminaltest"
 		require.NoError(t, manager.RegisterScheme(terminalWorkspaceScheme,
 			func(ctx context.Context, cfg config.Config, uri workspaceapi.URI) (schemeapi.Scheme, error) {
@@ -4375,7 +4377,7 @@ func TestWorkspaceManagerRestoresOpenTerminalSessions(t *testing.T) {
 		sched, drain := newTestScheduler(t, mu)
 		manager := workspace.NewManager(config.NopConfig(), sched)
 		require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-			workspace.NewMemoryScheme))
+			terminalSchemeFunc(workspace.NewMemoryScheme)))
 		const terminalWorkspaceScheme = "terminaltest"
 		require.NoError(t, manager.RegisterScheme(terminalWorkspaceScheme,
 			func(ctx context.Context, cfg config.Config, uri workspaceapi.URI) (schemeapi.Scheme, error) {
@@ -4409,7 +4411,7 @@ func TestWorkspaceManagerRestoresOpenTerminalSessions(t *testing.T) {
 		ex2 := m2.exHandler(m2.focusHandler())
 		tabs := ex2.comp.Tabs()
 		require.Len(t, tabs, 1)
-		_, ok := tabs[0].Handler().(vtereservoir.VTE)
+		_, ok := tabs[0].Handler().(workspace.VTE)
 		require.True(t, ok)
 	})
 }
@@ -5822,7 +5824,7 @@ func TestComponentOnTabsClickIntegration(t *testing.T) {
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 
 	var uri *workspaceapi.URI
 	if dir != "" {
@@ -6532,9 +6534,9 @@ func newTestWorkspaceManagerHandlerWithDir(
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cc)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 	require.NoError(t, manager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileScheme))
+		terminalSchemeFunc(workspace.NewFileScheme)))
 
 	var uri *workspaceapi.URI
 	if dir != "" {
@@ -6570,9 +6572,9 @@ func newTestWorkspaceManagerHandlerWithDirs(
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cc)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 	require.NoError(t, manager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileScheme))
+		terminalSchemeFunc(workspace.NewFileScheme)))
 
 	var uri *workspaceapi.URI
 	if dir != "" {
@@ -6821,7 +6823,7 @@ func TestCloseWorkspaceRemovesClosedWorkspaceFromManager(t *testing.T) {
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 
 	uri, err := workspaceapi.ParseURI(fmt.Sprintf("memory:///%s", dir))
 	require.NoError(t, err)
@@ -6853,9 +6855,9 @@ func TestCloseWorkspaceClosesScheme(t *testing.T) {
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 	require.NoError(t, manager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileScheme))
+		terminalSchemeFunc(workspace.NewFileScheme)))
 
 	uri, err := workspaceapi.ParseURI("file://" + dir)
 	require.NoError(t, err)
@@ -6900,9 +6902,9 @@ func TestReloadWorkspaceClosesAndReopensScheme(t *testing.T) {
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 	require.NoError(t, manager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileScheme))
+		terminalSchemeFunc(workspace.NewFileScheme)))
 
 	uri, err := workspaceapi.ParseURI("file://" + dir)
 	require.NoError(t, err)
@@ -6995,7 +6997,7 @@ func TestCloseWorkspaceReturnsBeforeTeardown(t *testing.T) {
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 
 	uri, err := workspaceapi.ParseURI(fmt.Sprintf("memory://%s", dir))
 	require.NoError(t, err)
@@ -7096,7 +7098,7 @@ func TestReloadWaitsForCloseBeforeReopen(t *testing.T) {
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 
 	uri, err := workspaceapi.ParseURI(fmt.Sprintf("memory://%s", dir))
 	require.NoError(t, err)
@@ -7378,7 +7380,8 @@ func newPendingTeardownTestHandler(
 	manager := workspace.NewManagerWithWorkspaceFunc(
 		config.NopConfig(), scheduleNextTick, tracker.wrap,
 	)
-	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme, workspace.NewMemoryScheme))
+	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 	m := newTestWorkspaceManagerHandlerWithManagerMu(
 		t, manager, mu, drain, nil, cfg, FuncExtensionsRunner(testRunnerFn), nil,
 		t.TempDir(), nil, nopShutdownShaderConfig(),
@@ -7477,7 +7480,7 @@ func TestPendingWorkspaceCancellationClosesSchemeToAbortBuild(t *testing.T) {
 	mu, scheduleNextTick, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), scheduleNextTick)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 
 	const schemeName = "closeabort"
 	var blocked *closeUnblocksOpenScheme
@@ -7694,7 +7697,7 @@ func TestReloadWithWedgedVTEWarmupDoesNotDeadlock(t *testing.T) {
 			schemesMu.Lock()
 			schemes = append(schemes, s)
 			schemesMu.Unlock()
-			return s, nil
+			return vtescheme.NewServer(s), nil
 		})
 	// Warm one VTE per workspace so a wedged warm-up is in flight.
 	m.initialVTECapacity = 1
@@ -7806,7 +7809,7 @@ func TestBackgroundCloseCompletesWithUnabortableWarmup(t *testing.T) {
 			schemesMu.Lock()
 			schemes = append(schemes, s)
 			schemesMu.Unlock()
-			return s, nil
+			return vtescheme.NewServer(s), nil
 		})
 	m.initialVTECapacity = 1
 	m.mu.Unlock()
@@ -7911,9 +7914,9 @@ func TestCloseWorkspaceClosesExtensionPermissionsPartition(t *testing.T) {
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 	require.NoError(t, manager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileScheme))
+		terminalSchemeFunc(workspace.NewFileScheme)))
 
 	uri, err := workspaceapi.ParseURI("file://" + dir)
 	require.NoError(t, err)
@@ -7971,9 +7974,9 @@ func TestBuildExtensionsFailureClosesOwnedResources(t *testing.T) {
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 	require.NoError(t, manager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileScheme))
+		terminalSchemeFunc(workspace.NewFileScheme)))
 
 	uri, err := workspaceapi.ParseURI("file://" + dir)
 	require.NoError(t, err)
@@ -8335,9 +8338,9 @@ func newTestWorkspaceManagerHandlerWithRunner(
 	mu, sched, drain := buildTestSchedulerForCfg(t, &cc)
 	manager := workspace.NewManager(config.NopConfig(), sched)
 	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme,
-		workspace.NewMemoryScheme))
+		terminalSchemeFunc(workspace.NewMemoryScheme)))
 	require.NoError(t, manager.RegisterScheme(workspace.FileScheme,
-		workspace.NewFileScheme))
+		terminalSchemeFunc(workspace.NewFileScheme)))
 
 	uri := new(workspaceapi.URI)
 	var err error

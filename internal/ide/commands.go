@@ -434,27 +434,40 @@ var (
 			},
 			handler: (*ex).terminalneworsplit,
 		},
-		"terminalsave": {
+		"terminalattach": {
 			man: textapi.CommandManual{
-				Summary: "Save the current terminal buffer and scrollback under the given session name. " +
-					"The saved session stores terminal output for later recovery, but does not preserve " +
-					"or resume the live pty process.",
-				Synopsis: "<session-name>",
+				Summary: "Attach the current active window to a terminal the workspace " +
+					"already owns, named by its stable id. Terminals live in the " +
+					"workspace rather than in this session, so a terminal opened " +
+					"before Rune was restarted, or one attached from another Rune " +
+					"client, can be picked up again with its process still running. " +
+					"Use `terminalattach` completion to list the available ids.",
+				Synopsis: "<terminal-id>",
 			},
-			handler: (*ex).terminalsave,
-		},
-		"terminalresume": {
-			man: textapi.CommandManual{
-				Summary: "Open a previously saved terminal session by name in a functioning " +
-					"terminal, restoring its saved output and scrollback. This starts a new " +
-					"pty process; it does not resume the original process.",
-				Synopsis: "<session-name>",
-			},
-			handler: (*ex).terminalresume,
+			handler: (*ex).terminalattach,
 			completer: func(e *ex, ctx context.Context, cmd textapi.Command,
 			) (iterator.Iterator[string], string, error) {
-				return e.completeTerminalSessions(ctx, cmd)
+				return e.completeAttachableTerminals(ctx, cmd)
 			},
+		},
+		"terminaldetach": {
+			man: textapi.CommandManual{
+				Summary: "Release this session's attachment to the terminal in the " +
+					"current active window. The terminal, its pty and its running " +
+					"process are left untouched in the workspace and can be attached " +
+					"again with `terminalattach`. Use `terminalclose` to terminate " +
+					"the terminal instead.",
+			},
+			handler: (*ex).terminaldetach,
+		},
+		"terminalclose": {
+			man: textapi.CommandManual{
+				Summary: "Terminate the terminal in the current active window in the " +
+					"workspace that owns it, killing its pty and its running process. " +
+					"This is destructive and affects every session attached to that " +
+					"terminal; use `terminaldetach` to only let go of it here.",
+			},
+			handler: (*ex).terminalclose,
 		},
 		"edit": {
 			man: textapi.CommandManual{

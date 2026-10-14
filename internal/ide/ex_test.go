@@ -70,7 +70,6 @@ import (
 	"unstable.build/rune/internal/ide/plugin"
 	"unstable.build/rune/internal/term/programstatus"
 	"unstable.build/rune/internal/term/vte"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
 	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/text/cmdenv"
 	"unstable.build/rune/internal/text/emacs"
@@ -81,6 +80,7 @@ import (
 	"unstable.build/rune/internal/text/texttest"
 	"unstable.build/rune/internal/text/vi"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
 	"unstable.build/rune/internal/workspace/workspacetest"
 )
 
@@ -138,8 +138,6 @@ func (t *testFileBuffer) Close() error {
 }
 
 type testLoader struct {
-	workspacetest.NopVTEOwner
-
 	buf *testFileBuffer
 	// exitStartedCommands makes StartCommand's stub process exit
 	// immediately with success, mirroring the Executor contract that
@@ -147,6 +145,72 @@ type testLoader struct {
 	// long-running process (e.g. plugin-wait timeouts) leave it
 	// false so the stub process never exits.
 	exitStartedCommands bool
+
+	// self is the outermost scheme the terminal server must call back
+	// into. A double that embeds testLoader and overrides a transport
+	// method has to set it to itself, otherwise the server binds to
+	// the embedded base and bypasses the override.
+	self schemeapi.Scheme
+
+	vteMu     sync.Mutex
+	vteServer *vtescheme.Server
+}
+
+// terminals lazily builds the workspace server that owns the
+// emulators, so ide tests drive terminals through the same
+// CreateVTE/AttachVTE path as production instead of a nop.
+func (w *testLoader) terminals() workspace.VTEOwner {
+	w.vteMu.Lock()
+	defer w.vteMu.Unlock()
+	if w.vteServer == nil {
+		host := schemeapi.Scheme(w)
+		if w.self != nil {
+			host = w.self
+		}
+		w.vteServer = vtescheme.NewServer(host)
+	}
+	return w.vteServer
+}
+
+// closeTerminals ends every terminal the loader's server still owns.
+// Close cannot do it: the server closes its host scheme, which is this
+// loader.
+func (w *testLoader) closeTerminals() error {
+	w.vteMu.Lock()
+	server := w.vteServer
+	w.vteMu.Unlock()
+	if server == nil {
+		return nil
+	}
+	return server.Close()
+}
+
+// closeTestTerminals closes, once the test is over, the terminals a
+// workspace built on testLoader leaves running.
+func closeTestTerminals(t *testing.T, ws workspace.Workspace) {
+	if l, ok := ws.(interface{ closeTerminals() error }); ok {
+		t.Cleanup(func() { _ = l.closeTerminals() })
+	}
+}
+
+func (w *testLoader) CreateVTE(
+	ctx context.Context, opts workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	return w.terminals().CreateVTE(ctx, opts)
+}
+
+func (w *testLoader) ListVTEs(ctx context.Context) ([]workspace.VTEInfo, error) {
+	return w.terminals().ListVTEs(ctx)
+}
+
+func (w *testLoader) AttachVTE(
+	ctx context.Context, id workspace.VTEID,
+) (workspace.VTE, error) {
+	return w.terminals().AttachVTE(ctx, id)
+}
+
+func (w *testLoader) DeleteVTE(ctx context.Context, id workspace.VTEID) error {
+	return w.terminals().DeleteVTE(ctx, id)
 }
 
 func (w *testLoader) Remove(string) error {
@@ -260,31 +324,31 @@ func (w *testLoader) StopWatch(int) error {
 	return nil
 }
 
-func (t testLoader) Chroot(path string) (schemeapi.Scheme, error) {
+func (t *testLoader) Chroot(path string) (schemeapi.Scheme, error) {
 	panic("unimplemented")
 }
 
-func (t testLoader) Root() string {
+func (t *testLoader) Root() string {
+	return "/"
+}
+
+func (t *testLoader) Symlink(target, link string) error {
 	panic("unimplemented")
 }
 
-func (t testLoader) Symlink(target, link string) error {
+func (t *testLoader) TempFile(dir, prefix string) (workspaceapi.File, error) {
 	panic("unimplemented")
 }
 
-func (t testLoader) TempFile(dir, prefix string) (workspaceapi.File, error) {
+func (t *testLoader) Join(elem ...string) string {
 	panic("unimplemented")
 }
 
-func (t testLoader) Join(elem ...string) string {
+func (t *testLoader) Create(filename string) (workspaceapi.File, error) {
 	panic("unimplemented")
 }
 
-func (t testLoader) Create(filename string) (workspaceapi.File, error) {
-	panic("unimplemented")
-}
-
-func (t testLoader) Open(filename string) (workspaceapi.File, error) {
+func (t *testLoader) Open(filename string) (workspaceapi.File, error) {
 	panic("unimplemented")
 }
 
@@ -3652,6 +3716,7 @@ func newExForTestingVTECapacity(
 
 	uri, err := ws.URI(".")
 	require.NoError(t, err)
+	closeTestTerminals(t, ws)
 
 	emulatorCfg := vte.DefaultConfig()
 	scheduler, mu := installDefaultTestScheduler(&emulatorCfg)
@@ -3680,11 +3745,13 @@ type blockingResizeWorkspace struct {
 }
 
 func newBlockingResizeWorkspace() *blockingResizeWorkspace {
-	return &blockingResizeWorkspace{
+	ret := &blockingResizeWorkspace{
 		testLoader: &testLoader{},
 		entered:    make(chan [2]int, 64),
 		release:    make(chan struct{}),
 	}
+	ret.testLoader.self = ret
+	return ret
 }
 
 func (w *blockingResizeWorkspace) SetPtySize(
@@ -3770,6 +3837,18 @@ func TestExResizeDoesNotBlockOnPtyResize(t *testing.T) {
 	})
 }
 
+// newTerminalFileScheme serves the file scheme at uri the way
+// production does, through a workspace server that owns its terminals,
+// so a test gets real terminals over the same CreateVTE path.
+func newTerminalFileScheme(t *testing.T, uri workspaceapi.URI) *vtescheme.Server {
+	t.Helper()
+	fileScheme, err := workspace.NewFileScheme(context.Background(), config.NopConfig(), uri)
+	require.NoError(t, err)
+	s := vtescheme.NewServer(fileScheme)
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
 // remoteURILoader is a testLoader whose workspace lives on another
 // machine.
 type remoteURILoader struct {
@@ -3791,7 +3870,7 @@ func TestExGraphicsTempDir(t *testing.T) {
 }
 
 func newExForTestingWithWorkspace(
-	t *testing.T, workspace workspace.Workspace,
+	t *testing.T, ws workspace.Workspace,
 	ed text.Editor,
 	emulatorCfg vte.Config,
 	publishEvent func(term.Event) bool,
@@ -3810,15 +3889,16 @@ func newExForTestingWithWorkspace(
 	notifications := newWorkspaceNotifications(svc, notificationsConfig(),
 		&workspaceManagerMock{workspace: ex})
 
-	uri, err := workspace.URI(".")
+	uri, err := ws.URI(".")
 	require.NoError(t, err)
+	closeTestTerminals(t, ws)
 
 	scheduler, mu := installDefaultTestScheduler(&emulatorCfg)
-	require.NoError(t, ex.init(func(exoeditor.Reloader, schemeapi.Terminal) (text.Editor, error) { return ed, nil }, workspace, svc,
+	require.NoError(t, ex.init(func(exoeditor.Reloader, schemeapi.Terminal) (text.Editor, error) { return ed, nil }, ws, svc,
 		notifications, uri, emulatorCfg, plugin.DefaultBarConfig(),
 		publishEvent, 0, clip, nil, nil, ex.Browser(), nil, testPromptEditor(), testNameGenerator, finalOpts...))
 	ex.subscribeCommands()
-	ex.newEmulatorHandler = func(args []string) (vtereservoir.VTE, error) {
+	ex.newEmulatorHandler = func(args []string) (workspace.VTE, error) {
 		return newTestVteWithConfig(args), nil
 	}
 	ex.newPluginHandler = func(_ int, args ...string) (pluginHandler, error) {
@@ -3829,7 +3909,7 @@ func newExForTestingWithWorkspace(
 }
 
 func newExForTestingCommandsPreview(
-	t *testing.T, workspace workspace.Workspace,
+	t *testing.T, ws workspace.Workspace,
 	ed text.Editor,
 	emulatorCfg vte.Config,
 	publishEvent func(term.Event) bool,
@@ -3849,15 +3929,15 @@ func newExForTestingCommandsPreview(
 	notifications := newWorkspaceNotifications(svc, notificationsConfig(),
 		&workspaceManagerMock{workspace: ex})
 
-	uri, err := workspace.URI(".")
+	uri, err := ws.URI(".")
 	require.NoError(t, err)
 
 	scheduler, mu := installDefaultTestScheduler(&emulatorCfg)
-	require.NoError(t, ex.init(func(exoeditor.Reloader, schemeapi.Terminal) (text.Editor, error) { return ed, nil }, workspace, svc,
+	require.NoError(t, ex.init(func(exoeditor.Reloader, schemeapi.Terminal) (text.Editor, error) { return ed, nil }, ws, svc,
 		notifications, uri, emulatorCfg, plugin.DefaultBarConfig(),
 		publishEvent, 0, clip, nil, previews, ex.Browser(), nil, testPromptEditor(), testNameGenerator, finalOpts...))
 	ex.subscribeCommands()
-	ex.newEmulatorHandler = func(args []string) (vtereservoir.VTE, error) {
+	ex.newEmulatorHandler = func(args []string) (workspace.VTE, error) {
 		return newTestVteWithConfig(args), nil
 	}
 	ex.newPluginHandler = func(_ int, args ...string) (pluginHandler, error) {
@@ -3883,7 +3963,7 @@ func newExForTestingClipboard(
 // be booted on the same backing storage (e.g. to exercise workspace
 // layout restore flows).
 func newExForTestingWithStorage(
-	t *testing.T, workspace workspace.Workspace, svc storageapi.Service,
+	t *testing.T, ws workspace.Workspace, svc storageapi.Service,
 	ed text.Editor,
 	emulatorCfg vte.Config,
 	publishEvent func(term.Event) bool,
@@ -3900,14 +3980,14 @@ func newExForTestingWithStorage(
 	notifications := newWorkspaceNotifications(svc, notificationsConfig(),
 		&workspaceManagerMock{workspace: ex})
 
-	uri, err := workspace.URI(".")
+	uri, err := ws.URI(".")
 	require.NoError(t, err)
 
-	require.NoError(t, ex.init(func(exoeditor.Reloader, schemeapi.Terminal) (text.Editor, error) { return ed, nil }, workspace, svc,
+	require.NoError(t, ex.init(func(exoeditor.Reloader, schemeapi.Terminal) (text.Editor, error) { return ed, nil }, ws, svc,
 		notifications, uri, emulatorCfg, plugin.DefaultBarConfig(),
 		publishEvent, 0, clip, nil, nil, ex.Browser(), nil, testPromptEditor(), testNameGenerator, finalOpts...))
 	ex.subscribeCommands()
-	ex.newEmulatorHandler = func(args []string) (vtereservoir.VTE, error) {
+	ex.newEmulatorHandler = func(args []string) (workspace.VTE, error) {
 		return newTestVteWithConfig(args), nil
 	}
 	ex.newPluginHandler = func(_ int, args ...string) (pluginHandler, error) {
@@ -4915,12 +4995,9 @@ func TestIntegrationEphemeralTerminal(t *testing.T) {
 	})
 	uri, err := workspaceapi.ParseURI(filepath.Join("file://", tempDir))
 	require.NoError(t, err)
-	ctx := context.Background()
-	fileScheme, err := workspace.NewFileScheme(ctx, config.NopConfig(), uri)
-	require.NoError(t, err)
-	defer fileScheme.Close()
+	termScheme := newTerminalFileScheme(t, uri)
 
-	workspace := workspace.NewSchemeWorkspace(uri, fileScheme, inlineSchedule)
+	workspace := workspace.NewSchemeWorkspace(uri, termScheme, inlineSchedule)
 	b := newExForTestingTerminal(t, workspace,
 		standard.Editor(),
 		vte.DefaultConfig(), nopPublishEvent, plugin.DefaultBarConfig(), opts...)
@@ -5127,10 +5204,7 @@ func TestIntegrationCompanionTerminal(t *testing.T) {
 	})
 	uri, err := workspaceapi.ParseURI(filepath.Join("file://", tempDir))
 	require.NoError(t, err)
-	ctx := context.Background()
-	fileScheme, err := workspace.NewFileScheme(ctx, config.NopConfig(), uri)
-	require.NoError(t, err)
-	defer fileScheme.Close()
+	termScheme := newTerminalFileScheme(t, uri)
 
 	// do not depend on host shell, which can vary across hosts
 	cfg := vte.DefaultConfig()
@@ -5142,7 +5216,7 @@ func TestIntegrationCompanionTerminal(t *testing.T) {
 	os.Setenv("PS1", "sh ")
 	defer os.Setenv("PS1", ps1)
 
-	workspace := workspace.NewSchemeWorkspace(uri, fileScheme, inlineSchedule)
+	workspace := workspace.NewSchemeWorkspace(uri, termScheme, inlineSchedule)
 	b := newExForTestingTerminal(t, workspace,
 		texttest.NopEditor(), cfg, nopPublishEvent, plugin.DefaultBarConfig(), opts...)
 	defer b.Close()
@@ -5150,21 +5224,19 @@ func TestIntegrationCompanionTerminal(t *testing.T) {
 	handlertest.TestHandlerSequence(t, b, 20, 10, cases)
 }
 
-func TestTerminalWriteOpensSavePrompt(t *testing.T) {
-	b := newExForTesting(t, texttest.NopEditor())
+// TestTerminalWriteIsNotASave pins that :w no longer snapshots a
+// terminal. A terminal outlives this session in the workspace that
+// owns it, so there is nothing for a save to preserve.
+func TestTerminalWriteIsNotASave(t *testing.T) {
+	b := newExForTestingVTECapacity(t, &testLoader{}, 0)
 	defer b.Close()
 
-	require.NoError(t, b.ex.terminalnew(context.Background(), "terminal output"))
-	require.NoError(t, b.ex.flush(context.Background()))
-	require.Nil(t, b.ex.cmd)
+	require.NoError(t, b.ex.terminalnew(context.Background()))
+	b.waitAsyncVTELoads()
+	b.flushScheduled()
 
-	var doc terminalSessionDocument
-	require.NoError(t, b.ex.terminalSessionStorage().Get(context.Background(),
-		terminalSessionDocumentID("terminal-saved"), &doc))
-	require.Equal(t, "terminal-saved", doc.Name)
-	require.Equal(t, terminalSessionDocumentKind, doc.Kind,
-		"saved sessions must carry the kind the completer filters on")
-	require.Contains(t, term.CellsToString(doc.Snapshot.ActiveCells()), "terminal output")
+	assert.ErrorIs(t, b.ex.flush(context.Background()), textapi.ErrInvalidSave)
+	assert.ErrorIs(t, b.ex.forceFlush(context.Background()), textapi.ErrInvalidSave)
 }
 
 func TestTerminalNewForwardsShellArgument(t *testing.T) {
@@ -5208,7 +5280,7 @@ func TestTerminalNewForwardsShellArgument(t *testing.T) {
 				defer b.Close()
 				var captured []string
 				var captureCalled bool
-				b.ex.newEmulatorHandler = func(args []string) (vtereservoir.VTE, error) {
+				b.ex.newEmulatorHandler = func(args []string) (workspace.VTE, error) {
 					captureCalled = true
 					captured = append([]string(nil), args...)
 					h := newTestVteWithConfig(args)
@@ -5356,7 +5428,7 @@ func newExForReservoirTesting(
 	// real routing in ex.init exactly.
 	var reservoirGets atomic.Int64
 	var newCalls atomic.Int64
-	e.newEmulatorHandler = func(args []string) (vtereservoir.VTE, error) {
+	e.newEmulatorHandler = func(args []string) (workspace.VTE, error) {
 		if e.reservoir != nil && argsMatchEmulatorShell(args, e.emulatorConfig.CommandAndArgs) {
 			reservoirGets.Add(1)
 		} else {
@@ -5374,141 +5446,582 @@ func newExForReservoirTesting(
 	}
 }
 
-func TestTerminalWriteUsesNextAvailableName(t *testing.T) {
-	b := newExForTesting(t, texttest.NopEditor())
-	defer b.Close()
-
-	require.NoError(t, b.ex.terminalnew(context.Background(), "terminal output"))
-	require.NoError(t, b.ex.flush(context.Background()))
-	require.NoError(t, b.ex.flush(context.Background()))
-
-	var doc terminalSessionDocument
-	require.NoError(t, b.ex.terminalSessionStorage().Get(context.Background(),
-		terminalSessionDocumentID("terminal-saved-1"), &doc))
-	require.Equal(t, "terminal-saved-1", doc.Name)
+// terminalPlacements are the ways a terminal can sit in the window in
+// focus: filling it, or in a tab.
+var terminalPlacements = []struct {
+	name string
+	open func(e *ex, ctx context.Context, args ...string) error
+}{
+	{name: "filling its window", open: (*ex).terminalnew},
+	{name: "in a tab", open: (*ex).terminalnewtab},
 }
 
-func TestTerminalSaveAndResume(t *testing.T) {
-	b := newExForTesting(t, texttest.NopEditor())
-	defer b.Close()
+// TestTerminalDetachLeavesTheTerminalRunning pins the split between the
+// two ways of letting go of a terminal: detaching drops this client's
+// attachment while the emulator, its pty and its process stay in the
+// workspace, so terminalattach picks the very same one up again.
+func TestTerminalDetachLeavesTheTerminalRunning(t *testing.T) {
+	for _, placement := range terminalPlacements {
+		t.Run(placement.name, func(t *testing.T) {
+			ws := &testLoader{}
+			b := newExForTestingVTECapacity(t, ws, 0)
+			defer b.Close()
+			ctx := context.Background()
 
-	require.NoError(t, b.ex.terminalnew(context.Background(), "terminal output"))
-	require.NoError(t, b.ex.terminalsave(context.Background(), "demo"))
-	require.NoError(t, b.ex.terminalresume(context.Background(), "demo"))
+			require.NoError(t, placement.open(b.ex, ctx))
+			b.waitAsyncVTELoads()
+			b.flushScheduled()
 
-	content, err := b.ex.invokeWindow().Content()
-	require.NoError(t, err)
-	tab, ok := content.(*browser.Tab)
-	require.True(t, ok)
-	session, ok := tab.Handler().(*testVte)
-	require.True(t, ok)
-	require.True(t, session.restoredSnapshot)
-	require.Contains(t, session.initialCmd, "terminal output")
-	cursor, _, _ := session.Cursor()
-	require.Equal(t, term.Coordinates{X: 4, Y: 1}, cursor)
-	require.Equal(t, 2, session.SeekOffset())
+			h, ok := b.ex.terminalInFocus()
+			require.True(t, ok)
+			id := h.ID()
+			require.NotEmpty(t, id)
+
+			require.NoError(t, b.ex.terminaldetach(ctx))
+			_, ok = b.ex.terminalInFocus()
+			assert.False(t, ok, "detach must take the terminal out of the window")
+			assert.Eventually(t, func() bool {
+				infos, err := ws.ListVTEs(ctx)
+				return err == nil && len(infos) == 1 &&
+					infos[0].ID == id && infos[0].Attachments == 0
+			}, 5*time.Second, 5*time.Millisecond,
+				"detach must release this client's attachment, not the terminal")
+
+			require.NoError(t, b.ex.terminalattach(ctx, string(id)))
+			b.waitAsyncVTELoads()
+			b.flushScheduled()
+
+			h, ok = b.ex.terminalInFocus()
+			require.True(t, ok)
+			assert.Equal(t, id, h.ID(), "attach must reach the same terminal")
+		})
+	}
 }
 
-func TestTerminalResumeFindsSessionsSavedBeforeThePartitionMove(t *testing.T) {
-	b := newExForTesting(t, texttest.NopEditor())
-	defer b.Close()
+// TestTerminalCloseTerminatesTheTerminal pins the destructive command:
+// unlike detach it takes the emulator away from every client.
+func TestTerminalCloseTerminatesTheTerminal(t *testing.T) {
+	for _, placement := range terminalPlacements {
+		t.Run(placement.name, func(t *testing.T) {
+			ws := &testLoader{}
+			b := newExForTestingVTECapacity(t, ws, 0)
+			defer b.Close()
+			ctx := context.Background()
 
-	require.NoError(t, b.ex.storage.Set(context.Background(),
-		terminalSessionDocumentID("legacy"), terminalSessionDocument{
-			Name:     "legacy",
-			Snapshot: vte.Snapshot{Schema: 1, Title: "old"},
-		}))
-	require.NoError(t, b.ex.terminalresume(context.Background(), "legacy"))
+			require.NoError(t, placement.open(b.ex, ctx))
+			b.waitAsyncVTELoads()
+			b.flushScheduled()
+			_, ok := b.ex.terminalInFocus()
+			require.True(t, ok)
 
-	content, err := b.ex.invokeWindow().Content()
-	require.NoError(t, err)
-	tab, ok := content.(*browser.Tab)
-	require.True(t, ok)
-	session, ok := tab.Handler().(*testVte)
-	require.True(t, ok)
-	require.True(t, session.restoredSnapshot)
-
-	var moved terminalSessionDocument
-	require.NoError(t, b.ex.terminalSessionStorage().Get(context.Background(),
-		terminalSessionDocumentID("legacy"), &moved))
-	require.Equal(t, terminalSessionDocumentKind, moved.Kind)
-	require.ErrorIs(t, b.ex.storage.Get(context.Background(),
-		terminalSessionDocumentID("legacy"), &moved), storageapi.ErrNotFound,
-		"a resumed legacy session must leave the listed partition")
-
-	require.ErrorIs(t,
-		b.ex.terminalresume(context.Background(), "missing"), storageapi.ErrNotFound)
+			require.NoError(t, b.ex.terminalclose(ctx))
+			_, ok = b.ex.terminalInFocus()
+			assert.False(t, ok)
+			assert.Eventually(t, func() bool {
+				infos, err := ws.ListVTEs(ctx)
+				return err == nil && len(infos) == 0
+			}, 5*time.Second, 5*time.Millisecond,
+				"close must terminate the terminal in the workspace")
+		})
+	}
 }
 
-func TestOpenTerminalSessionsPersistAndRestore(t *testing.T) {
-	b := newExForTesting(t, texttest.NopEditor())
+// TestTerminalInFocus pins which terminal the terminal commands act on:
+// the one in the window in focus wherever it sits, the companion
+// terminal included, and none in a window without one.
+func TestTerminalInFocus(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		open   func(e *ex, ctx context.Context) error
+		wantOK bool
+	}{
+		{
+			name: "filling its window",
+			open: func(e *ex, ctx context.Context) error {
+				return e.terminalnew(ctx)
+			},
+			wantOK: true,
+		},
+		{
+			name: "in a tab",
+			open: func(e *ex, ctx context.Context) error {
+				return e.terminalnewtab(ctx)
+			},
+			wantOK: true,
+		},
+		{
+			name: "the companion terminal",
+			open: func(e *ex, _ context.Context) error {
+				return e.toggleCompanionTerminal()
+			},
+			wantOK: true,
+		},
+		{
+			name: "a window without a terminal",
+			open: func(*ex, context.Context) error { return nil },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newExForTestingVTECapacity(t, &testLoader{}, 0)
+			defer b.Close()
+			v := newTestVte()
+			b.ex.newEmulatorHandler = func([]string) (workspace.VTE, error) {
+				return v, nil
+			}
+
+			require.NoError(t, tc.open(b.ex, context.Background()))
+			h, ok := b.ex.terminalInFocus()
+			require.Equal(t, tc.wantOK, ok)
+			if ok {
+				assert.Equal(t, v.ID(), h.ID())
+			}
+		})
+	}
+}
+
+// TestDefaultColors pins what :defaultcolors recolors: the terminal in
+// focus wherever it sits, and nothing in a window without one.
+func TestDefaultColors(t *testing.T) {
+	red, blue := term.GetColor("red"), term.GetColor("blue")
+
+	for _, tc := range []struct {
+		name    string
+		open    func(e *ex, ctx context.Context, args ...string) error
+		args    []string
+		want    term.Attributes
+		wantErr string
+	}{
+		{
+			name: "a terminal filling its window",
+			open: (*ex).terminalnew,
+			args: []string{"red", "blue"},
+			want: term.Attributes{Bg: red, Fg: blue},
+		},
+		{
+			name: "a terminal in a tab",
+			open: (*ex).terminalnewtab,
+			args: []string{"red"},
+			want: term.Attributes{Bg: red},
+		},
+		{
+			name:    "a window without a terminal",
+			args:    []string{"red"},
+			wantErr: "cannot change colors of this window",
+		},
+		{
+			name:    "no background",
+			open:    (*ex).terminalnew,
+			wantErr: "command expects at least one argument 'background'",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newExForTestingVTECapacity(t, &testLoader{}, 0)
+			defer b.Close()
+			ctx := context.Background()
+			v := newTestVte()
+			b.ex.newEmulatorHandler = func([]string) (workspace.VTE, error) {
+				return v, nil
+			}
+			if tc.open != nil {
+				require.NoError(t, tc.open(b.ex, ctx))
+			}
+
+			err := b.ex.defaultcolors(ctx, tc.args...)
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.want, v.defAttr)
+		})
+	}
+}
+
+func TestTerminalDetachAndCloseRequireATerminal(t *testing.T) {
+	b := newExForTestingVTECapacity(t, &testLoader{}, 0)
 	defer b.Close()
-	var terminalID int
-	b.ex.newEmulatorHandler = func(args []string) (vtereservoir.VTE, error) {
-		terminalID++
-		h := newTestVteWithConfig(args)
-		uri, err := workspaceapi.ParseURI(fmt.Sprintf("terminaltest:///%d", terminalID))
-		if err != nil {
-			return nil, err
+
+	assert.EqualError(t, b.ex.terminaldetach(context.Background()), "not a terminal")
+	assert.EqualError(t, b.ex.terminalclose(context.Background()), "not a terminal")
+}
+
+// gatedVTEWorkspace holds every terminal create and attach until the
+// test releases it, which is how a test catches a terminal still
+// loading.
+type gatedVTEWorkspace struct {
+	*testLoader
+	gate chan struct{}
+}
+
+func (w *gatedVTEWorkspace) wait(ctx context.Context) error {
+	if w.gate == nil {
+		return nil
+	}
+	select {
+	case <-w.gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (w *gatedVTEWorkspace) CreateVTE(
+	ctx context.Context, opts workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	if err := w.wait(ctx); err != nil {
+		return nil, err
+	}
+	return w.testLoader.CreateVTE(ctx, opts)
+}
+
+func (w *gatedVTEWorkspace) AttachVTE(
+	ctx context.Context, id workspace.VTEID,
+) (workspace.VTE, error) {
+	if err := w.wait(ctx); err != nil {
+		return nil, err
+	}
+	return w.testLoader.AttachVTE(ctx, id)
+}
+
+// requireTerminals waits until the workspace holds exactly want
+// terminals, keyed by id to the number of attachments each has.
+func requireTerminals(
+	t *testing.T, ws workspace.VTEOwner, want map[workspace.VTEID]int, msg string,
+) {
+	t.Helper()
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		infos, err := ws.ListVTEs(context.Background())
+		if !assert.NoError(c, err) {
+			return
 		}
-		h.uri = uri
-		return h, nil
+		got := map[workspace.VTEID]int{}
+		for _, info := range infos {
+			got[info.ID] = info.Attachments
+		}
+		assert.Equal(c, want, got)
+	}, 5*time.Second, 5*time.Millisecond, msg)
+}
+
+// A terminal the user never got to see is nobody's: letting go of it
+// must destroy it, or it runs on in the workspace with nothing showing
+// it. A terminal that already existed is only detached.
+func TestTerminalAbandonedWhileLoading(t *testing.T) {
+	ctx := context.Background()
+	closeWindow := func(e *ex) error { return e.tabclose(ctx) }
+
+	for _, placement := range terminalPlacements {
+		t.Run("a new terminal "+placement.name+" is terminated", func(t *testing.T) {
+			ws := &gatedVTEWorkspace{testLoader: &testLoader{}, gate: make(chan struct{})}
+			b := newExForTestingVTECapacity(t, ws, 0)
+			defer b.Close()
+
+			require.NoError(t, placement.open(b.ex, ctx))
+			require.NoError(t, closeWindow(b.ex))
+			close(ws.gate)
+			b.waitAsyncVTELoads()
+			b.flushScheduled()
+
+			requireTerminals(t, ws, map[workspace.VTEID]int{},
+				"an abandoned new terminal must not keep running")
+		})
 	}
 
-	require.NoError(t, b.ex.terminalnewtab(context.Background(), "first terminal"))
-	require.NoError(t, b.ex.terminalnewtab(context.Background(), "second terminal"))
+	t.Run("an attached terminal keeps running", func(t *testing.T) {
+		ws := &gatedVTEWorkspace{testLoader: &testLoader{}}
+		b := newExForTestingVTECapacity(t, ws, 0)
+		defer b.Close()
+		require.NoError(t, b.ex.terminalnew(ctx))
+		b.waitAsyncVTELoads()
+		b.flushScheduled()
+		h, ok := b.ex.terminalInFocus()
+		require.True(t, ok)
+		id := h.ID()
+		require.NoError(t, b.ex.terminaldetach(ctx))
+
+		ws.gate = make(chan struct{})
+		require.NoError(t, b.ex.terminalattach(ctx, string(id)))
+		require.NoError(t, closeWindow(b.ex))
+		close(ws.gate)
+		b.waitAsyncVTELoads()
+		b.flushScheduled()
+
+		requireTerminals(t, ws, map[workspace.VTEID]int{id: 0},
+			"giving up on an attach must only detach")
+	})
+}
+
+func TestTerminalCloseTerminatesALoadingTerminal(t *testing.T) {
+	ctx := context.Background()
+
+	for _, placement := range terminalPlacements {
+		t.Run("a new terminal "+placement.name, func(t *testing.T) {
+			ws := &gatedVTEWorkspace{testLoader: &testLoader{}, gate: make(chan struct{})}
+			b := newExForTestingVTECapacity(t, ws, 0)
+			defer b.Close()
+
+			require.NoError(t, placement.open(b.ex, ctx))
+			require.NoError(t, b.ex.terminalclose(ctx))
+			close(ws.gate)
+			b.waitAsyncVTELoads()
+			b.flushScheduled()
+
+			requireTerminals(t, ws, map[workspace.VTEID]int{},
+				"close must terminate a terminal that arrives after it")
+		})
+	}
+
+	t.Run("a terminal being attached", func(t *testing.T) {
+		ws := &gatedVTEWorkspace{testLoader: &testLoader{}}
+		b := newExForTestingVTECapacity(t, ws, 0)
+		defer b.Close()
+		require.NoError(t, b.ex.terminalnew(ctx))
+		b.waitAsyncVTELoads()
+		b.flushScheduled()
+		h, ok := b.ex.terminalInFocus()
+		require.True(t, ok)
+		id := h.ID()
+		require.NoError(t, b.ex.terminaldetach(ctx))
+
+		ws.gate = make(chan struct{})
+		require.NoError(t, b.ex.terminalattach(ctx, string(id)))
+		require.NoError(t, b.ex.terminalclose(ctx))
+		close(ws.gate)
+		b.waitAsyncVTELoads()
+		b.flushScheduled()
+
+		requireTerminals(t, ws, map[workspace.VTEID]int{},
+			"close must terminate the terminal the attach reaches")
+	})
+}
+
+func TestTerminalDetachAndCloseOnTheCompanionTerminal(t *testing.T) {
+	ctx := context.Background()
+	open := func(t *testing.T) (testEx, *testLoader, workspace.VTEID) {
+		t.Helper()
+		ws := &testLoader{}
+		b := newExForTestingVTECapacity(t, ws, 0)
+		require.NoError(t, b.ex.toggleCompanionTerminal())
+		b.waitAsyncVTELoads()
+		b.flushScheduled()
+		h, ok := b.ex.terminalInFocus()
+		require.True(t, ok)
+		require.NotEmpty(t, h.ID())
+		return b, ws, h.ID()
+	}
+
+	t.Run("detach", func(t *testing.T) {
+		b, ws, id := open(t)
+		defer b.Close()
+
+		require.NoError(t, b.ex.terminaldetach(ctx))
+		assert.Nil(t, b.ex.companionTerminal, "the next toggle opens a new terminal")
+		assert.Nil(t, b.ex.companionTerminalWin, "its window goes with it")
+		requireTerminals(t, ws, map[workspace.VTEID]int{id: 0},
+			"detach must release the companion terminal, not destroy it")
+	})
+
+	t.Run("close", func(t *testing.T) {
+		b, ws, _ := open(t)
+		defer b.Close()
+
+		require.NoError(t, b.ex.terminalclose(ctx))
+		assert.Nil(t, b.ex.companionTerminal, "the next toggle opens a new terminal")
+		assert.Nil(t, b.ex.companionTerminalWin, "its window goes with it")
+		requireTerminals(t, ws, map[workspace.VTEID]int{},
+			"close must terminate the companion terminal")
+	})
+}
+
+func TestTerminalAttachTakesOneID(t *testing.T) {
+	b := newExForTestingVTECapacity(t, &testLoader{}, 0)
+	defer b.Close()
+
+	for _, args := range [][]string{nil, {""}, {"a", "b"}} {
+		assert.Error(t, b.ex.terminalattach(context.Background(), args...),
+			"args %q", args)
+	}
+}
+
+// TestOpenTerminalSessionsPersistAndRestore pins that a persisted
+// session names the emulator it was attached to and that restoring
+// reattaches to that same emulator, so a terminal that outlived the
+// previous Rune session comes back live instead of as a picture of
+// itself.
+func TestOpenTerminalSessionsPersistAndRestore(t *testing.T) {
+	// Both sessions share one workspace because the terminals belong
+	// to it; that is what makes reattaching possible at all.
+	ws := &testLoader{}
+	b := newExForTestingVTECapacity(t, ws, 0)
+	defer b.Close()
+
+	require.NoError(t, b.ex.terminalnewtab(context.Background()))
+	require.NoError(t, b.ex.terminalnewtab(context.Background()))
+	b.waitAsyncVTELoads()
+	b.flushScheduled()
+
 	sessions := exSnapshotter{ex: b.ex}.Terminals()
 	require.Len(t, sessions, 2)
-	require.Contains(t, term.CellsToString(sessions[0].Snapshot.ActiveCells()), "first terminal")
-	require.Contains(t, term.CellsToString(sessions[1].Snapshot.ActiveCells()), "second terminal")
+	var want []workspace.VTEID
+	for _, session := range sessions {
+		require.NotEmpty(t, session.VTEID)
+		want = append(want, session.VTEID)
+	}
 
-	restored := newExForTesting(t, texttest.NopEditor())
+	restored := newExForTestingVTECapacity(t, ws, 0)
 	defer restored.Close()
 	require.NoError(t, restoreOpenTerminalSessions(restored.ex, sessions, nil))
+	restored.waitAsyncVTELoads()
+	restored.flushScheduled()
 
 	tabs := restored.ex.comp.Tabs()
 	require.Len(t, tabs, 2)
-
-	var restoredCommands []string
+	var got []workspace.VTEID
 	for _, tab := range tabs {
-		session, ok := tab.Handler().(*testVte)
+		h, ok := tab.Handler().(workspace.VTE)
 		require.True(t, ok)
-		require.True(t, session.restoredSnapshot)
-		restoredCommands = append(restoredCommands, session.initialCmd)
+		got = append(got, h.ID())
 	}
-	require.ElementsMatch(t, []string{"first terminal", "second terminal"}, restoredCommands)
+	assert.ElementsMatch(t, want, got,
+		"restore must reattach to the emulators the session named")
 }
 
-func TestTerminalSessionCompletionListsUserSavedSessions(t *testing.T) {
-	b := newExForTesting(t, texttest.NopEditor())
+// attachFailureWorkspace fails every attach with a caller-supplied
+// error and counts the terminals created in its place.
+type attachFailureWorkspace struct {
+	*testLoader
+	attachErr error
+	creates   atomic.Int64
+}
+
+func (w *attachFailureWorkspace) AttachVTE(
+	context.Context, workspace.VTEID,
+) (workspace.VTE, error) {
+	return nil, w.attachErr
+}
+
+func (w *attachFailureWorkspace) CreateVTE(
+	ctx context.Context, opts workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	w.creates.Add(1)
+	return w.testLoader.CreateVTE(ctx, opts)
+}
+
+// TestRestoreOnlyReplacesAConfirmedMissingTerminal pins the rule that
+// keeps a live terminal from being silently discarded: only the
+// workspace saying the emulator does not exist may produce a
+// replacement built from the stale snapshot.
+func TestRestoreOnlyReplacesAConfirmedMissingTerminal(t *testing.T) {
+	restore := func(t *testing.T, attachErr error) *attachFailureWorkspace {
+		t.Helper()
+		ws := &attachFailureWorkspace{
+			testLoader: &testLoader{}, attachErr: attachErr,
+		}
+		b := newExForTestingVTECapacity(t, ws, 0)
+		defer b.Close()
+		h := b.ex.attachOrRestoreTerminal(idehistory.TerminalSession{
+			Name: "restored", VTEID: workspace.NewVTEID(),
+		})
+		b.waitAsyncVTELoads()
+		b.flushScheduled()
+		av, ok := h.(*asyncVTE)
+		require.True(t, ok)
+		if attachErr == workspace.ErrVTENotFound {
+			assert.NoError(t, av.err)
+		} else {
+			assert.Error(t, av.err,
+				"an unconfirmed attach failure must surface")
+		}
+		return ws
+	}
+
+	t.Run("an unreachable workspace never replaces a terminal", func(t *testing.T) {
+		ws := restore(t, errors.New("connection reset by peer"))
+		assert.Zero(t, ws.creates.Load())
+	})
+
+	t.Run("a confirmed missing terminal is replaced", func(t *testing.T) {
+		ws := restore(t, workspace.ErrVTENotFound)
+		assert.EqualValues(t, 1, ws.creates.Load())
+	})
+}
+
+// A state save must not forget a restored session the terminal has not
+// yet reached, or failed to reach: the next restore would otherwise
+// open a fresh terminal and strand the one still running.
+func TestSaveKeepsARestoredSessionUntilItsTerminalArrives(t *testing.T) {
+	doc := idehistory.TerminalSession{
+		Name:     "restored",
+		VTEID:    workspace.NewVTEID(),
+		Snapshot: vte.Snapshot{Schema: 1, Title: "saved session"},
+	}
+	saved := func(t *testing.T, e *ex) idehistory.TerminalSession {
+		t.Helper()
+		sessions := exSnapshotter{ex: e}.Terminals()
+		require.Len(t, sessions, 1)
+		return sessions[0]
+	}
+
+	t.Run("while it loads", func(t *testing.T) {
+		ws := &gatedVTEWorkspace{testLoader: &testLoader{}, gate: make(chan struct{})}
+		b := newExForTestingVTECapacity(t, ws, 0)
+		defer b.Close()
+		defer b.waitAsyncVTELoads()
+		defer close(ws.gate)
+
+		require.NoError(t, restoreOpenTerminalSessions(b.ex,
+			[]idehistory.TerminalSession{{
+				Name: doc.Name, VTEID: doc.VTEID, Snapshot: doc.Snapshot, Tab: true,
+			}}, nil))
+		got := saved(t, b.ex)
+		assert.Equal(t, doc.VTEID, got.VTEID)
+		assert.Equal(t, doc.Snapshot, got.Snapshot)
+	})
+
+	t.Run("after it failed to load", func(t *testing.T) {
+		ws := &attachFailureWorkspace{
+			testLoader: &testLoader{}, attachErr: errors.New("connection reset by peer"),
+		}
+		b := newExForTestingVTECapacity(t, ws, 0)
+		defer b.Close()
+
+		require.NoError(t, restoreOpenTerminalSessions(b.ex,
+			[]idehistory.TerminalSession{{
+				Name: doc.Name, VTEID: doc.VTEID, Snapshot: doc.Snapshot, Tab: true,
+			}}, nil))
+		b.waitAsyncVTELoads()
+		b.flushScheduled()
+		got := saved(t, b.ex)
+		assert.Equal(t, doc.VTEID, got.VTEID)
+		assert.Equal(t, doc.Snapshot, got.Snapshot)
+	})
+}
+
+func TestTerminalAttachCompletionListsWorkspaceTerminals(t *testing.T) {
+	ws := &testLoader{}
+	b := newExForTestingVTECapacity(t, ws, 0)
 	defer b.Close()
+	ctx := context.Background()
 
-	require.NoError(t, b.ex.terminalnew(context.Background(), "terminal output"))
-	require.NoError(t, b.ex.terminalsave(context.Background(), "manual"))
+	require.NoError(t, b.ex.terminalnew(ctx))
+	b.waitAsyncVTELoads()
+	b.flushScheduled()
+	h, ok := b.ex.terminalInFocus()
+	require.True(t, ok)
 
-	it, _, err := b.ex.completeTerminalSessions(context.Background(), textapi.Command{})
+	it, _, err := b.ex.completeAttachableTerminals(ctx, textapi.Command{})
 	require.NoError(t, err)
 	defer it.Close()
 
-	var names []string
+	var ids []string
 	for {
-		name, ok := it.Next(context.Background())
+		id, ok := it.Next(ctx)
 		if !ok {
 			break
 		}
-		names = append(names, name)
+		ids = append(ids, id)
 	}
 	require.NoError(t, it.Err())
-
-	require.Equal(t, []string{"manual"}, names)
-}
-
-func TestTerminalSaveCommandRequiresTerminal(t *testing.T) {
-	b := newExForTesting(t, texttest.NopEditor())
-	defer b.Close()
-
-	err := b.ex.terminalsave(context.Background(), "demo")
-	require.EqualError(t, err, "not a terminal")
+	assert.Equal(t, []string{string(h.ID())}, ids)
 }
 
 type closeCountingStorage struct {
@@ -5562,21 +6075,10 @@ func TestExUsesSharedIDEStorage(t *testing.T) {
 	require.Equal(t, 0, storage.partitionCalls)
 	require.Same(t, storage, ex.storage)
 
-	// Saved terminal sessions live in their own partition, opened on
-	// demand and released with the ex so cached backend handles are not
-	// leaked per workspace.
-	_, _, err = ex.completeTerminalSessions(context.Background(), textapi.Command{})
-	require.NoError(t, err)
-	require.Equal(t, 1, storage.partitionCalls)
-	terminals := storage.partitions[idehistory.TerminalStatePartition]
-	require.NotNil(t, terminals)
-
 	require.NoError(t, ex.Close())
 	require.Equal(t, 0, storage.closeCalls)
-	require.Equal(t, 1, terminals.closeCalls)
 	require.NoError(t, ex.Close())
 	require.Equal(t, 0, storage.closeCalls)
-	require.Equal(t, 1, terminals.closeCalls)
 }
 
 func TestFullScreen(t *testing.T) {
@@ -5619,12 +6121,9 @@ func TestFullScreen(t *testing.T) {
 	})
 	uri, err := workspaceapi.ParseURI(filepath.Join("file://", tempDir))
 	require.NoError(t, err)
-	ctx := context.Background()
-	fileScheme, err := workspace.NewFileScheme(ctx, config.NopConfig(), uri)
-	require.NoError(t, err)
-	defer fileScheme.Close()
+	termScheme := newTerminalFileScheme(t, uri)
 
-	workspace := workspace.NewSchemeWorkspace(uri, fileScheme, inlineSchedule)
+	workspace := workspace.NewSchemeWorkspace(uri, termScheme, inlineSchedule)
 	b := newExForTestingWithWorkspace(t, workspace,
 		texttest.NopEditor(), vte.DefaultConfig(), nopPublishEvent,
 		clipboard.NewInMemory(), opts...)
@@ -5744,12 +6243,9 @@ func TestMoveWindowContent(t *testing.T) {
 	})
 	uri, err := workspaceapi.ParseURI(filepath.Join("file://", tempDir))
 	require.NoError(t, err)
-	ctx := context.Background()
-	fileScheme, err := workspace.NewFileScheme(ctx, config.NopConfig(), uri)
-	require.NoError(t, err)
-	defer fileScheme.Close()
+	termScheme := newTerminalFileScheme(t, uri)
 
-	workspace := workspace.NewSchemeWorkspace(uri, fileScheme, inlineSchedule)
+	workspace := workspace.NewSchemeWorkspace(uri, termScheme, inlineSchedule)
 	b := newExForTestingWithWorkspace(t, workspace,
 		texttest.NopEditor(), vte.DefaultConfig(), nopPublishEvent,
 		clipboard.NewInMemory(), opts...)
@@ -5858,12 +6354,9 @@ func TestResizeWindows(t *testing.T) {
 	})
 	uri, err := workspaceapi.ParseURI(filepath.Join("file://", tempDir))
 	require.NoError(t, err)
-	ctx := context.Background()
-	fileScheme, err := workspace.NewFileScheme(ctx, config.NopConfig(), uri)
-	require.NoError(t, err)
-	defer fileScheme.Close()
+	termScheme := newTerminalFileScheme(t, uri)
 
-	workspace := workspace.NewSchemeWorkspace(uri, fileScheme, inlineSchedule)
+	workspace := workspace.NewSchemeWorkspace(uri, termScheme, inlineSchedule)
 	b := newExForTestingWithWorkspace(t, workspace,
 		texttest.NopEditor(), vte.DefaultConfig(), nopPublishEvent,
 		clipboard.NewInMemory(), opts...)
@@ -6135,7 +6628,7 @@ func TestTerminalOnFocus(t *testing.T) {
 		ex := newExForTestingWithWorkspace(t, workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule),
 			texttest.NopEditor(), testConfig, nopPublishEvent, clipboard.NewInMemory())
 		tvte := newTestVte()
-		ex.newEmulatorHandler = func(args []string) (vtereservoir.VTE, error) {
+		ex.newEmulatorHandler = func(args []string) (workspace.VTE, error) {
 			assert.Equal(t, "echo bla", strings.Join(args, " "))
 			return tvte, nil
 		}
@@ -6189,7 +6682,7 @@ func TestTerminalOnFocus(t *testing.T) {
 		ex := newExForTestingWithWorkspace(t, workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule),
 			texttest.NopEditor(), vte.DefaultConfig(), nopPublishEvent, clipboard.NewInMemory())
 		tvte := newTestVte()
-		ex.newEmulatorHandler = func([]string) (vtereservoir.VTE, error) { return tvte, nil }
+		ex.newEmulatorHandler = func([]string) (workspace.VTE, error) { return tvte, nil }
 		t.Cleanup(func() { _ = ex.Close() })
 
 		ex.terminalnewtab(context.Background(), "echo", "bla")
@@ -6240,7 +6733,7 @@ func TestTerminalOnFocus(t *testing.T) {
 		ex := newExForTestingWithWorkspace(t, workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule),
 			texttest.NopEditor(), testConfig, nopPublishEvent, clipboard.NewInMemory())
 		tvte := newTestVte()
-		ex.newEmulatorHandler = func([]string) (vtereservoir.VTE, error) {
+		ex.newEmulatorHandler = func([]string) (workspace.VTE, error) {
 			return tvte, nil
 		}
 		t.Cleanup(func() { _ = ex.Close() })
@@ -6249,7 +6742,7 @@ func TestTerminalOnFocus(t *testing.T) {
 		ex.executePlugin(context.Background())
 		content, err := ex.invokeWindow().Content()
 		require.NoError(t, err)
-		_, ok := content.(vtereservoir.VTE)
+		_, ok := content.(workspace.VTE)
 		require.True(t, ok)
 
 		require.Len(t, tvte.onFocusChange, 2)
@@ -8762,6 +9255,7 @@ type testVte struct {
 	isComplete bool
 	uri        workspaceapi.URI
 	title      string
+	id         workspace.VTEID
 }
 
 func newTestVte() *testVte {
@@ -8772,7 +9266,12 @@ func newTestVteWithConfig(initialCmd []string) *testVte {
 	ret := new(testVte)
 	ret.initialCmd = strings.Join(initialCmd, " ")
 	ret.String = component.NewString(ret.initialCmd)
+	ret.id = workspace.NewVTEID()
 	return ret
+}
+
+func (t *testVte) ID() workspace.VTEID {
+	return t.id
 }
 
 func (t *testVte) Handle(ev term.Event) (bool, bool) {
@@ -8902,8 +9401,12 @@ func newExForTestingTasks(t *testing.T) (testEx, *sync.Mutex, func()) {
 	ctx := context.Background()
 	fileScheme, err := workspace.NewFileScheme(ctx, config.NopConfig(), uri)
 	require.NoError(t, err)
-	defer fileScheme.Close()
-	workspace := workspace.NewSchemeWorkspace(uri, fileScheme, inlineSchedule)
+	// Production wraps the file scheme so terminals live in a
+	// workspace server; hosting the registry in-process gives these
+	// tests real terminals over the same CreateVTE path.
+	termScheme := vtescheme.NewServer(fileScheme)
+	defer termScheme.Close()
+	workspace := workspace.NewSchemeWorkspace(uri, termScheme, inlineSchedule)
 	vteConfig := vte.DefaultConfig()
 	vteConfig.ScheduleNextTick = func(fn func()) bool {
 		go func() {

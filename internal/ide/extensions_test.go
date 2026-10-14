@@ -846,7 +846,8 @@ func newPkgInstallExtHandler(
 	dir := t.TempDir()
 
 	manager := workspace.NewManager(cfg.workspace(), sched)
-	manager.RegisterScheme(workspace.FileScheme, workspace.NewFileScheme)
+	manager.RegisterScheme(workspace.FileScheme,
+		terminalSchemeFunc(workspace.NewFileScheme))
 
 	notiCfg := notificationsConfig()
 	storage := localstorage.New(context.Background(), dir, docbson.Marshaler())

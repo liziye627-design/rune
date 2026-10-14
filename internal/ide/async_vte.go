@@ -28,9 +28,10 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"unstable.build/rune/internal/browser"
 	"unstable.build/rune/internal/debug"
+	"unstable.build/rune/internal/ide/idehistory"
 	"unstable.build/rune/internal/term/programstatus"
 	"unstable.build/rune/internal/term/vte"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
+	"unstable.build/rune/internal/workspace"
 )
 
 const asyncVTELoadingTitle = "terminal (connecting…)"
@@ -39,7 +40,13 @@ const maxQueuedAsyncVTEEvents = 256
 
 var asyncVTEURICounter atomic.Uint64
 
-var _ vtereservoir.VTE = (*asyncVTE)(nil)
+var _ workspace.VTE = (*asyncVTE)(nil)
+
+// vteFactory builds the terminal an asyncVTE stands in for. created
+// reports that the factory brought the emulator into existence rather
+// than attaching to one that already ran: nobody else knows of such a
+// terminal, so letting go of it before it is shown must terminate it.
+type vteFactory func() (v workspace.VTE, created bool, err error)
 
 type tabNameAliaser struct {
 	browser.TabManager
@@ -172,19 +179,26 @@ func (a *tabNameAliaser) removeAliasesTo(target workspaceapi.URI) {
 	}
 }
 
-// asyncVTE is a permanent vtereservoir.VTE wrapper that runs the
+// asyncVTE is a permanent workspace.VTE wrapper that runs the
 // blocking VTE factory (reservoir warm-up waits, NewPty/StartCommand
 // RPCs) off the host event loop.
 type asyncVTE struct {
 	e   *ex
 	uri workspaceapi.URI
+	// cmdAndArgs is what this terminal was opened with. It is
+	// persisted so a session whose emulator is confirmed gone can be
+	// reopened with the same intent.
+	cmdAndArgs []string
 
 	anim        *component.Animation
 	animStopped bool
 
-	real   vtereservoir.VTE
+	real   workspace.VTE
 	err    error
 	closed bool
+	// terminate makes a terminal that arrives after Close be
+	// terminated rather than only detached from.
+	terminate bool
 
 	width, height int
 	resized       bool
@@ -194,11 +208,19 @@ type asyncVTE struct {
 	pendingFocus    *bool
 	pendingAttrs    *term.Attributes
 
+	// standIn is the persisted session this terminal restores. It is
+	// reported in the terminal's place until the terminal arrives, so
+	// a state save meanwhile, or after the restore failed, keeps the
+	// session rather than stranding the terminal it names.
+	standIn *idehistory.TerminalSession
+
 	errComp component.String
 }
 
-func newAsyncVTE(e *ex, factory func() (vtereservoir.VTE, error)) *asyncVTE {
-	av := &asyncVTE{e: e}
+func newAsyncVTE(
+	e *ex, cmdAndArgs []string, factory vteFactory,
+) *asyncVTE {
+	av := &asyncVTE{e: e, cmdAndArgs: cmdAndArgs}
 	uri, err := workspaceapi.ParseURI(fmt.Sprintf(
 		"terminal://loading/%d", asyncVTEURICounter.Add(1)))
 	if err == nil {
@@ -211,12 +233,16 @@ func newAsyncVTE(e *ex, factory func() (vtereservoir.VTE, error)) *asyncVTE {
 	e.asyncVTELoads.Add(1)
 	go debug.CapturePanicReport(func() {
 		defer e.asyncVTELoads.Done()
-		v, ferr := factory()
-		if !e.sched(func() { av.complete(v, ferr) }) {
+		v, created, ferr := factory()
+		if !e.sched(func() { av.complete(v, created, ferr) }) {
 			// The event loop is gone: nothing will ever install the
 			// result, so release the freshly-built VTE.
 			if ferr == nil && v != nil {
+				id := v.ID()
 				_ = v.Close()
+				if created {
+					_ = deleteVTE(e.workspace, id)
+				}
 			}
 			av.stopAnimation()
 		}
@@ -225,13 +251,17 @@ func newAsyncVTE(e *ex, factory func() (vtereservoir.VTE, error)) *asyncVTE {
 }
 
 // complete installs the factory result. It runs on the host event loop.
-func (av *asyncVTE) complete(v vtereservoir.VTE, err error) {
+func (av *asyncVTE) complete(v workspace.VTE, created bool, err error) {
 	if av.closed {
 		// Only a successful build hands over an owned, fully
 		// initialized VTE; closing anything else is unsafe.
 		if err == nil && v != nil {
 			av.e.tabAliases.discardStatus(v.URI())
+			id := v.ID()
 			_ = v.Close()
+			if created || av.terminate {
+				av.e.terminateVTE(id)
+			}
 		}
 		return
 	}
@@ -393,14 +423,17 @@ func (av *asyncVTE) SetDefaultAttributes(attr term.Attributes) {
 }
 
 // Snapshot forwards when ready. Pre-ready it returns the queued
-// restore snapshot if present so a state save during load keeps the
-// session, and a zero snapshot otherwise.
+// restore snapshot, or the restored session's, if present so a state
+// save during load keeps the session, and a zero snapshot otherwise.
 func (av *asyncVTE) Snapshot() (vte.Snapshot, error) {
 	if av.real != nil {
 		return av.real.Snapshot()
 	}
 	if av.pendingSnapshot != nil {
 		return *av.pendingSnapshot, nil
+	}
+	if av.standIn != nil {
+		return av.standIn.Snapshot, nil
 	}
 	return vte.Snapshot{}, nil
 }
@@ -427,6 +460,20 @@ func (av *asyncVTE) IsComplete() bool {
 // change when the real VTE arrives.
 func (av *asyncVTE) URI() workspaceapi.URI {
 	return av.uri
+}
+
+// ID is empty until the terminal arrives: the canonical emulator has
+// no identity before it exists, and callers persisting the id (see
+// exSnapshotter.Terminals) must not record a placeholder. A restored
+// session already names its emulator, so that name stands in.
+func (av *asyncVTE) ID() workspace.VTEID {
+	if av.real != nil {
+		return av.real.ID()
+	}
+	if av.standIn != nil {
+		return av.standIn.VTEID
+	}
+	return ""
 }
 
 func (av *asyncVTE) Title() string {
@@ -480,7 +527,13 @@ func (av *asyncVTE) Close() error {
 	if av.real != nil {
 		return av.real.Close()
 	}
-	// Pre-ready: complete observes av.closed and closes the
-	// freshly-built VTE silently (the user abandoned the terminal).
+	// Pre-ready: complete observes av.closed and lets go of the
+	// terminal once it arrives.
 	return nil
+}
+
+// terminateOnArrival makes a terminal still loading be terminated once
+// it arrives, rather than detached from, after it is closed.
+func (av *asyncVTE) terminateOnArrival() {
+	av.terminate = true
 }

@@ -37,6 +37,7 @@ import (
 	"unstable.build/rune/internal/term/vte"
 	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
 )
 
 func TestE2ETerminalTabExit(t *testing.T) {
@@ -313,11 +314,12 @@ func newTerminalExitE2EEx(t *testing.T, dir string) (testEx, *atomic.Bool) {
 	fileScheme, err := workspace.NewFileScheme(
 		context.Background(), config.NopConfig(), uri)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = fileScheme.Close() })
+	scheme := vtescheme.NewLoopback(fileScheme)
+	t.Cleanup(func() { _ = scheme.Close() })
 
 	woke := new(atomic.Bool)
 	b := newExForTestingTerminal(t,
-		workspace.NewSchemeWorkspace(uri, fileScheme, inlineSchedule),
+		workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule),
 		exitTestEditor(), vte.DefaultConfig(), nopPublishEvent,
 		plugin.DefaultBarConfig(),
 		text.WithEventPublisher(func(ev term.Event) bool {

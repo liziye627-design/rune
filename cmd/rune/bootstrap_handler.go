@@ -207,6 +207,8 @@ func (b *bootstrapHandler) buildPreIDE() (*ide.IDE, error) {
 		ide.WithTabsClickCallback(b.handleTabsClick),
 		ide.WithClipboard(b.clip),
 		ide.WithSystemURLOpener(b.openBrowser),
+		ide.WithWorkspaceServerCommand(workspaceServerCommand(
+			b.dataDir, b.configPath)),
 	}
 	preIDE, err := ide.New("", b.configPath, b.dataDir, b.trust, b.storage, opts...)
 	if err != nil {
@@ -247,6 +249,8 @@ func (b *bootstrapHandler) buildConfiguredIDE(
 		ide.WithHostDataDir(b.dataDir),
 		ide.WithScheme(workspace.DocsScheme, newDocsSchemeFunc(b.configPath)),
 		ide.WithTabsClickCallback(b.handleTabsClick),
+		ide.WithWorkspaceServerCommand(workspaceServerCommand(
+			b.dataDir, b.configPath)),
 		ide.WithPackageConfigMergeHook(b.packageConfigMergeHook),
 		ide.WithDispatchOnPreview(cmdSetTheme,
 			func(cmd string, args ...string) (component.Responsive, func(), bool) {

@@ -75,6 +75,7 @@ import (
 	"unstable.build/rune/internal/text/exoeditor"
 	"unstable.build/rune/internal/text/textrpc"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
 )
 
 const (
@@ -142,14 +143,9 @@ type ex struct {
 	// CommandSubstResolver, plugin.New, the VTE) capture this value
 	// once and continue to route through whatever underlying
 	// schemeapi.Executor setExecutor last installed.
-	executor           *currentExecutor
-	extensionsExecutor *workspaceshell.Executor
-	storage            storageapi.Service
-	// terminalStorage holds saved terminal sessions, whose snapshots
-	// are too large to share a partition with anything that is listed.
-	// It is opened on first use and released by Close: a firstmover
-	// partition caches backend handles once resolved.
-	terminalStorage          storageapi.Service
+	executor                 *currentExecutor
+	extensionsExecutor       *workspaceshell.Executor
+	storage                  storageapi.Service
 	workspaceURI             workspaceapi.URI
 	closed                   bool
 	home                     bool
@@ -158,7 +154,7 @@ type ex struct {
 	container                *notifications.Container
 	notifications            browserapi.Notifications
 	emulatorConfig           vte.Config
-	newEmulatorHandler       func([]string) (vtereservoir.VTE, error)
+	newEmulatorHandler       func([]string) (workspace.VTE, error)
 	tm                       browser.TabManager
 	tabAliases               *tabNameAliaser
 	newPluginHandler         func(int, ...string) (pluginHandler, error)
@@ -223,7 +219,7 @@ type ex struct {
 	isPromptDispatch bool
 	macro            macroRecorder
 
-	companionTerminal    vtereservoir.VTE
+	companionTerminal    workspace.VTE
 	companionTerminalWin browser.Window
 	companionConsole     *ideconsole.Handler
 	companionConsoleURI  workspaceapi.URI
@@ -384,36 +380,28 @@ func (e *ex) init(
 	e.comp.SubscribeWindow((*windowSubscriber)(e))
 	if initialVTECapacity != 0 {
 		e.initialReservoirCapacity = initialVTECapacity
-		e.reservoir = vtereservoir.New(e.Browser(), e.Browser(),
-			e.terminal, e.executor, e.tm, e.emulatorConfig, initialVTECapacity)
+		e.reservoir = vtereservoir.New(exTerminals{e}, e.terminal,
+			e.emulatorConfig, initialVTECapacity)
 	}
 	newEmulator := func(cmdAndArgs []string) (
-		vtereservoir.VTE, error,
+		workspace.VTE, error,
 	) {
 		if e.reservoir != nil && argsMatchEmulatorShell(cmdAndArgs, e.emulatorConfig.CommandAndArgs) {
 			e.log(log.TraceLevel, "getting vte instance from reservoir")
 			return e.reservoir.Get()
 		}
-		cfg := e.emulatorConfig
-		if len(cmdAndArgs) != 0 {
-			cfg.CommandAndArgs = cmdAndArgs
-		}
-		v, err := vte.NewHandler(e.Browser(), e.Browser(),
-			e.terminal, e.executor, e.tm, cfg)
-		if err != nil {
-			return nil, err
-		}
-		return vteAdapter{v}, nil
+		return e.createVTE(cmdAndArgs)
 	}
 	e.newEmulatorHandler = func(cmdAndArgs []string) (
-		vtereservoir.VTE, error,
+		workspace.VTE, error,
 	) {
 		// Spawns can block on transport RPCs (reservoir warm-up
 		// waits, NewPty/StartCommand); run them off the event loop
 		// behind a placeholder so the UI stays responsive even when
 		// the workspace transport is slow or wedged.
-		return newAsyncVTE(e, func() (vtereservoir.VTE, error) {
-			return newEmulator(cmdAndArgs)
+		return newAsyncVTE(e, cmdAndArgs, func() (workspace.VTE, bool, error) {
+			v, err := newEmulator(cmdAndArgs)
+			return v, true, err
 		}), nil
 	}
 	pluginOpts := []plugin.Option{
@@ -495,10 +483,86 @@ func (e *ex) setExecutor(
 	e.extensionsExecutor = extExec
 	if e.reservoir != nil {
 		_ = e.reservoir.Close()
-		e.reservoir = vtereservoir.New(e.Browser(), e.Browser(),
-			e.terminal, e.executor, e.tm, e.emulatorConfig,
-			e.initialReservoirCapacity)
+		e.reservoir = vtereservoir.New(exTerminals{e}, e.terminal,
+			e.emulatorConfig, e.initialReservoirCapacity)
 	}
+}
+
+// defaultVTESpawnTimeout bounds a terminal open when the emulator
+// config carries no explicit budget. It only keeps a spawn against a
+// wedged workspace finite; the call already runs off the event loop.
+const defaultVTESpawnTimeout = 30 * time.Second
+
+// createVTE opens a terminal on the workspace. The emulator belongs to
+// the workspace server, so it outlives this client and the returned
+// value is only an attachment to it.
+func (e *ex) createVTE(cmdAndArgs []string) (workspace.VTE, error) {
+	cfg := e.emulatorConfig
+	if len(cmdAndArgs) != 0 {
+		cfg.CommandAndArgs = cmdAndArgs
+	}
+	ctx, cancel := e.vteRequestContext(cfg)
+	defer cancel()
+	return e.workspace.CreateVTE(ctx, workspace.CreateVTEOptions{
+		CommandAndArgs: cfg.CommandAndArgs,
+		Width:          cfg.WidthHint,
+		Height:         cfg.HeightHint,
+		MaxLines:       cfg.MaxLines,
+	})
+}
+
+// attachVTE reattaches to a terminal the workspace already owns.
+func (e *ex) attachVTE(id workspace.VTEID) (workspace.VTE, error) {
+	ctx, cancel := e.vteRequestContext(e.emulatorConfig)
+	defer cancel()
+	return e.workspace.AttachVTE(ctx, id)
+}
+
+// vteRequestContext bounds a terminal request by cfg's spawn budget
+// and carries what the terminal it returns needs from this browser.
+func (e *ex) vteRequestContext(cfg vte.Config) (context.Context, context.CancelFunc) {
+	timeout := cfg.SpawnTimeout
+	if timeout == 0 {
+		timeout = defaultVTESpawnTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return e.vteHostContext(ctx, cfg), cancel
+}
+
+// vteHostContext carries this browser's collaborators to whatever
+// builds the emulator. A terminal owned by a workspace server is
+// replayed locally, so its bells, notifications and tab titles are
+// this window's rather than the server's.
+func (e *ex) vteHostContext(
+	ctx context.Context, cfg vte.Config,
+) context.Context {
+	return vtescheme.WithClientVTEEnv(ctx, vtescheme.ClientVTEEnv{
+		Publisher:     e.Browser(),
+		Notifications: e.notifications,
+		// Dynamic tab titles go through the aliaser so they reach the
+		// tab key the terminal's window was opened under.
+		Tabs:   e.tm,
+		Config: cfg,
+	})
+}
+
+// exTerminals lets the reservoir warm terminals that already belong to
+// this browser. A pooled terminal is handed straight to a window, so
+// it must be built with the same collaborators one opened on demand
+// gets.
+type exTerminals struct{ e *ex }
+
+// CreateVTE satisfies vtereservoir.Terminals.
+func (t exTerminals) CreateVTE(
+	ctx context.Context, opts workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	return t.e.workspace.CreateVTE(
+		t.e.vteHostContext(ctx, t.e.emulatorConfig), opts)
+}
+
+// DeleteVTE satisfies vtereservoir.Terminals.
+func (t exTerminals) DeleteVTE(ctx context.Context, id workspace.VTEID) error {
+	return t.e.workspace.DeleteVTE(ctx, id)
 }
 
 func (e *ex) completeReadFile(
@@ -985,19 +1049,6 @@ func (e *ex) flush(ctx context.Context, args ...string) error {
 	if h, ok := e.fileExplorerHandlerInFocus(); ok {
 		return h.flush()
 	}
-	if h, ok := e.terminalInFocus(); ok {
-		var name string
-		var err error
-		if len(args) == 0 {
-			name, err = e.nextTerminalSessionName(ctx, h)
-		} else {
-			name, err = normalizeTerminalSessionName(args)
-		}
-		if err != nil {
-			return err
-		}
-		return e.saveTerminalSession(ctx, name, h)
-	}
 	uri, t, ok := e.focusTab()
 	if !ok {
 		return textapi.ErrInvalidSave
@@ -1008,19 +1059,6 @@ func (e *ex) flush(ctx context.Context, args ...string) error {
 func (e *ex) forceFlush(ctx context.Context, args ...string) error {
 	if h, ok := e.fileExplorerHandlerInFocus(); ok {
 		return h.forceFlush()
-	}
-	if h, ok := e.terminalInFocus(); ok {
-		var name string
-		var err error
-		if len(args) == 0 {
-			name, err = e.nextTerminalSessionName(ctx, h)
-		} else {
-			name, err = normalizeTerminalSessionName(args)
-		}
-		if err != nil {
-			return err
-		}
-		return e.saveTerminalSession(ctx, name, h)
 	}
 	uri, t, ok := e.focusTab()
 	if !ok {
@@ -1801,7 +1839,7 @@ func (e *ex) defaultcolors(_ context.Context, args ...string) error {
 	}
 
 	content, _ := e.invokeWindow().Content()
-	emh, ok := content.(vtereservoir.VTE)
+	emh, ok := content.(workspace.VTE)
 	if ok {
 		emh.SetDefaultAttributes(attrs)
 		return nil
@@ -1815,7 +1853,7 @@ func (e *ex) defaultcolors(_ context.Context, args ...string) error {
 		th.SetDefaultAttributes(attrs)
 		return nil
 	}
-	emh, ok = t.Handler().(vtereservoir.VTE)
+	emh, ok = t.Handler().(workspace.VTE)
 	if ok {
 		emh.SetDefaultAttributes(attrs)
 		return nil
@@ -2548,7 +2586,7 @@ func (e *ex) terminalneworsplit(_ context.Context, args ...string) error {
 	}
 	win := e.invokeWindow()
 	content, _ := win.Content()
-	_, vok := content.(vtereservoir.VTE)
+	_, vok := content.(workspace.VTE)
 	_, tok := content.(*browser.Tab)
 	if !vok && !tok {
 		err = win.SetContent(t)
@@ -3306,12 +3344,6 @@ func (e *ex) Close() (ret error) {
 	if err := e.container.Close(); err != nil {
 		ret = multierror.Append(ret, err)
 	}
-	if e.terminalStorage != nil {
-		if err := e.terminalStorage.Close(); err != nil {
-			ret = multierror.Append(ret, err)
-		}
-		e.terminalStorage = nil
-	}
 	return ret
 }
 
@@ -3431,14 +3463,12 @@ func onFocusChangeHandler(handler tui.Handler, isInFocus bool) {
 }
 
 func onFocusChangeTab(t *browser.Tab, isInFocus bool) {
-	emulator, ok := t.Handler().(vtereservoir.VTE)
+	emulator, ok := t.Handler().(workspace.VTE)
 	if !ok {
 		return
 	}
 	emulator.OnFocusChange(isInFocus)
 }
-
-var _ component.Scrollable = vteAdapter{}
 
 // argsMatchEmulatorShell reports whether the requested
 // terminal command is satisfied by the configured shell, in which
@@ -3451,37 +3481,8 @@ func argsMatchEmulatorShell(cmdAndArgs, configured []string) bool {
 	return slices.Equal(cmdAndArgs, configured)
 }
 
-// adapts vte.Handler to vtereservoir.VTE
-type vteAdapter struct {
-	*vte.Handler
-}
-
-func (v vteAdapter) SetDefaultAttributes(attr term.Attributes) {
-	v.Handler.SetDefaultAttributes(attr)
-}
-
-func (v vteAdapter) IsComplete() bool {
-	return v.Component().IsComplete()
-}
-
-func (v vteAdapter) URI() workspaceapi.URI {
-	return v.Component().URI()
-}
-
-func (v vteAdapter) Title() string {
-	return v.Component().Title()
-}
-
-func (v vteAdapter) UsedAlternateBuffer() bool {
-	return v.Component().UsedAlternateBuffer()
-}
-
-func (v vteAdapter) ClearPrimaryBuffer() bool {
-	return v.Component().ClearPrimaryBuffer()
-}
-
 var _ component.Scrollable = companionTerminalHandler{}
-var _ vtereservoir.VTE = companionTerminalHandler{}
+var _ workspace.VTE = companionTerminalHandler{}
 
 func (e *ex) fileExplorerHandlerInFocus() (*fileExplorerHandler, bool) {
 	if e.fileExplorerWin == nil || e.fileExplorerWin.Closed() {
@@ -3505,7 +3506,7 @@ func (e *ex) fileExplorerHandlerInFocus() (*fileExplorerHandler, bool) {
 // change to deliver on focus calls to underlying vte.Handler
 type companionTerminalHandler struct {
 	browser.Floating
-	vth vtereservoir.VTE
+	vth workspace.VTE
 }
 
 // SeekUp satisfies component.Scrollable.
@@ -3534,6 +3535,10 @@ func (c companionTerminalHandler) OnFocusChange(inFocus bool) {
 
 func (c companionTerminalHandler) SetDefaultAttributes(attr term.Attributes) {
 	c.vth.SetDefaultAttributes(attr)
+}
+
+func (c companionTerminalHandler) ID() workspace.VTEID {
+	return c.vth.ID()
 }
 
 func (c companionTerminalHandler) Snapshot() (vte.Snapshot, error) {

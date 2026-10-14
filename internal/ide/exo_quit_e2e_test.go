@@ -35,8 +35,8 @@ import (
 	"unstable.build/rune/internal/browser"
 	"unstable.build/rune/internal/handler/handlertest"
 	"unstable.build/rune/internal/ide/idepkg/pkgtrust"
-	"unstable.build/rune/internal/term/vte/vtereservoir"
 	"unstable.build/rune/internal/text"
+	"unstable.build/rune/internal/workspace"
 )
 
 func TestE2EExoUserQuitAutoClosesTab(t *testing.T) {
@@ -258,6 +258,8 @@ command:
 		WithLocker(mu),
 		WithScheduleNextTick(scheduleNextTick),
 		WithPublishEvent(func(term.Event) bool { return true }),
+		WithScheme(workspace.FileScheme,
+			terminalSchemeFunc(workspace.NewFileScheme)),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = i.Close() })
@@ -295,7 +297,7 @@ command:
 				if cerr != nil {
 					return
 				}
-				v, isVTE := content.(vtereservoir.VTE)
+				v, isVTE := content.(workspace.VTE)
 				if !isVTE {
 					return
 				}
