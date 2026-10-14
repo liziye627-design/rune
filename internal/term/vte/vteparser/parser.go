@@ -68,6 +68,9 @@ type Parser struct {
 	// scratch backs the single-byte Advance entry point so it can share
 	// the batched synchronized-update path without allocating.
 	scratch [1]byte
+	// continuation, when set, retains the bytes needed to resume this
+	// parser's unfinished state in another emulator.
+	continuation *ContinuationTracker
 }
 
 // NewParser returns a new Parser instance.
@@ -98,6 +101,31 @@ func (p *Parser) SyncTimeout() Timeout {
 	return p.state.syncState.timeout
 }
 
+// TrackContinuation makes the parser retain replay-safe bytes for its
+// unfinished state, so a snapshot taken at a feed boundary can be
+// resumed byte-exactly elsewhere.
+func (p *Parser) TrackContinuation(t *ContinuationTracker) {
+	p.continuation = t
+}
+
+// Grounded reports whether the parser holds no unfinished state: no
+// escape sequence, no partial UTF-8 codepoint and no open synchronized
+// update. It is the state in which a continuation is empty.
+func (p *Parser) Grounded() bool {
+	return p.scanner.State() == vtescanner.Ground && !p.SyncPending()
+}
+
+// SyncPending reports whether a synchronized update holds bytes the
+// parser has received but not yet interpreted.
+//
+// Those bytes bypass the scanner, so no continuation describes them: a
+// snapshot taken here would omit output that an observer teeing the
+// raw stream has already been handed.
+func (p *Parser) SyncPending() bool {
+	return len(p.state.syncState.buffer) > 0 ||
+		p.state.syncState.timeout.PendingTimeout()
+}
+
 // Advance processes a new byte from the PTY.
 func (p *Parser) Advance(ch byte) {
 	if p.state.syncState.timeout.PendingTimeout() {
@@ -105,7 +133,12 @@ func (p *Parser) Advance(ch byte) {
 		p.advanceSync(p.scratch[:])
 		return
 	}
+	p.replayTimedOutSync()
 	p.scanner.Advance(ch)
+	if p.continuation != nil {
+		p.scratch[0] = ch
+		p.continuation.track(p.scanner.State(), p.scratch[:])
+	}
 }
 
 // AdvanceBytes processes a batch of bytes from the PTY. Runs of
@@ -118,7 +151,17 @@ func (p *Parser) AdvanceBytes(buf []byte) {
 			buf = buf[p.advanceSync(buf):]
 			continue
 		}
+		p.replayTimedOutSync()
 		buf = buf[p.advanceRuns(buf, true):]
+	}
+}
+
+// replayTimedOutSync interprets the bytes of a synchronized update
+// whose timeout passed before its end marker arrived. Called before
+// any later output, which must not overtake them.
+func (p *Parser) replayTimedOutSync() {
+	if len(p.state.syncState.buffer) > 0 {
+		p.StopSync()
 	}
 }
 
@@ -144,12 +187,31 @@ func (p *Parser) advanceRuns(buf []byte, stopOnSync bool) int {
 			break
 		}
 	}
+	if p.continuation != nil {
+		p.continuation.track(p.scanner.State(), buf[:consumed])
+	}
 	return consumed
 }
 
 // StopSync ends a synchronized update.
 func (p *Parser) StopSync() {
 	p.stopSync(true)
+}
+
+// FlushExpiredSync replays a synchronized update whose timeout has
+// passed and reports whether it had anything to replay.
+//
+// An emitter that opens a region and then stops producing output — by
+// exiting, blocking or crashing — leaves those bytes buffered with no
+// later byte to trigger the replay, which would otherwise keep the
+// parser permanently short of a resumable stream position.
+func (p *Parser) FlushExpiredSync() bool {
+	if p.state.syncState.timeout.PendingTimeout() ||
+		len(p.state.syncState.buffer) == 0 {
+		return false
+	}
+	p.StopSync()
+	return true
 }
 
 func (p *Parser) stopSync(reportEnd bool) {

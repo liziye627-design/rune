@@ -166,8 +166,10 @@ func TestSyncUpdateOpenRegionBuffersUntilExpiry(t *testing.T) {
 	timeout.expired = true
 	parser.AdvanceBytes([]byte("!"))
 
-	require.Equal(t, len(body), parser.SyncBytesCount(),
+	require.Zero(t, parser.SyncBytesCount(),
 		"an expired region must stop buffering, not absorb new bytes")
+	require.Contains(t, dumpParserState(ph), "U+0075",
+		"an expired region's body must reach the screen before later output")
 }
 
 func TestSyncUpdateOverflowFlushesRegion(t *testing.T) {

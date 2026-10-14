@@ -747,6 +747,124 @@ func TestStopSyncTimeoutReplaysPartialMarker(t *testing.T) {
 	assert.Equal(t, 1, timeout.clears)
 }
 
+// TestFlushExpiredSyncTable pins when an abandoned synchronized update
+// is replayed: only once its timeout has passed, and only while it
+// still holds bytes.
+func TestFlushExpiredSyncTable(t *testing.T) {
+	tests := []struct {
+		name string
+		// stream is fed before the flush is attempted.
+		stream string
+		// expired flips the region's timeout before flushing.
+		expired   bool
+		wantFlush bool
+		// wantBuffered is what the region still holds afterwards.
+		wantBuffered int
+		wantRuns     []parserRunEvent
+	}{
+		{
+			name:   "nothing buffered",
+			stream: "plain output",
+		},
+		{
+			name:         "region still pending",
+			stream:       "\x1b[?2026hheld back",
+			wantBuffered: len("held back"),
+		},
+		{
+			name:      "abandoned region is replayed",
+			stream:    "\x1b[?2026habandoned",
+			expired:   true,
+			wantFlush: true,
+			wantRuns: []parserRunEvent{
+				{kind: "set-private", mode: PrivateModeSyncUpdate},
+				runEvent("abandoned"),
+				{kind: "unset-private", mode: PrivateModeSyncUpdate},
+			},
+		},
+		{
+			name:      "an empty abandoned region has nothing to replay",
+			stream:    "\x1b[?2026h",
+			expired:   true,
+			wantFlush: false,
+			wantRuns: []parserRunEvent{
+				{kind: "set-private", mode: PrivateModeSyncUpdate},
+			},
+		},
+		{
+			name:      "a closed region left nothing behind",
+			stream:    "\x1b[?2026hdone\x1b[?2026l",
+			expired:   true,
+			wantFlush: false,
+			wantRuns: []parserRunEvent{
+				{kind: "set-private", mode: PrivateModeSyncUpdate},
+				runEvent("done"),
+				{kind: "unset-private", mode: PrivateModeSyncUpdate},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := new(parserRunHandler)
+			timeout := new(recordingParserTimeout)
+			p := NewParser(h, timeout)
+			p.AdvanceBytes([]byte(tc.stream))
+			if tc.expired {
+				timeout.pending = false
+			}
+
+			assert.Equal(t, tc.wantFlush, p.FlushExpiredSync())
+			// Flushing is idempotent: a second attach must not replay
+			// the same bytes again.
+			assert.False(t, p.FlushExpiredSync())
+			// A region still inside its timeout keeps its bytes:
+			// the emitter may yet close it.
+			assert.Equal(t, tc.wantBuffered, p.SyncBytesCount())
+
+			if tc.wantRuns != nil {
+				assert.Equal(t, tc.wantRuns, h.events)
+			}
+		})
+	}
+}
+
+// Output that arrives after a synchronized update timed out follows
+// the bytes the update held back: interpreting it first would reorder
+// the stream.
+func TestSynchronizedUpdateExpiredBeforeMoreOutput(t *testing.T) {
+	tests := []struct {
+		name    string
+		advance func(*Parser, []byte)
+	}{
+		{name: "AdvanceBytes", advance: (*Parser).AdvanceBytes},
+		{name: "Advance", advance: func(p *Parser, b []byte) {
+			for _, ch := range b {
+				p.Advance(ch)
+			}
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := new(parserRunHandler)
+			timeout := new(recordingParserTimeout)
+			p := NewParser(h, timeout)
+			tc.advance(p, []byte("\x1b[?2026hab"))
+			timeout.pending = false
+			tc.advance(p, []byte("cd"))
+
+			assert.Equal(t, []parserRunEvent{
+				{kind: "set-private", mode: PrivateModeSyncUpdate},
+				inputEvent('a'), inputEvent('b'),
+				{kind: "unset-private", mode: PrivateModeSyncUpdate},
+				inputEvent('c'), inputEvent('d'),
+			}, normalizeParserRunEvents(h.events))
+			assert.Zero(t, p.SyncBytesCount())
+		})
+	}
+}
+
 func TestSynchronizedUpdateBufferAllocatesLazily(t *testing.T) {
 	h := new(countingParserHandler)
 	timeout := new(recordingParserTimeout)
