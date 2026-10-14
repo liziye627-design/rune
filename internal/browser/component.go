@@ -1593,7 +1593,12 @@ func (c *Component) Close() (ret error) {
 		if !ok {
 			bw = c.newWindow(w)
 		}
-		_ = bw.Close()
+		if bw.Close() != nil {
+			// The window manager never lets go of its last tiled
+			// window, but a closed browser shows nothing: release its
+			// content the way replacing it would.
+			c.updateWindowContent(bw, c.wallpaper(), nil)
+		}
 	})
 	return ret
 }
