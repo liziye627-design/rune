@@ -249,9 +249,20 @@ to joining and print the node's name, state, and addresses. From then on
 the machine shows up in `network peers` on your other machines and
 `workspaceopen rune://<machine>/path` works against it.
 
-A headless node serves the network and nothing else, so it needs
-`network.auto_join` left on: with it off there is no console to run
-`network up` in, and Rune says so and exits.
+The same process is the machine's own workspace server: a Rune editor
+running on the machine keeps the terminals of its local workspaces
+there, so they keep running after the editor quits. Images a program
+draws in such a terminal are not kept with it: reopening the terminal
+brings back its text, and the program has to draw its images again.
+With `network.auto_join` off that is all a headless node does. There is
+no console to run `network up` in, so it says so in its log and never
+joins.
+
+Only one such server runs per data directory. When the editor finds
+none it starts one of its own, which stays off the network. A second
+`rune --headless`, such as a service started while that one runs, exits
+with `there's another instance of Rune holding the lock` and the process
+ID of the one that holds it.
 
 ### Headless machines only serve
 

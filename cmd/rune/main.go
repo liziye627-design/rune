@@ -21,24 +21,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	multierr "github.com/ernestrc/go-multierror"
 	extbrowser "github.com/ernestrc/sensible/browser"
 	log "github.com/sirupsen/logrus"
 	flag "github.com/spf13/pflag"
-	"github.com/unstablebuild/blue/logging"
 	"github.com/unstablebuild/blue/release"
 	"github.com/unstablebuild/blue/release/cdnrelease"
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
@@ -47,7 +43,6 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"github.com/unstablebuild/rune-go-sdk/tui"
-	"google.golang.org/grpc"
 	"unstable.build/rune/auth"
 	"unstable.build/rune/cmd/rune/crashreport"
 	"unstable.build/rune/cmd/rune/ide/apiclient"
@@ -58,14 +53,11 @@ import (
 	"unstable.build/rune/internal/ide"
 	"unstable.build/rune/internal/ide/hostenv"
 	"unstable.build/rune/internal/ide/idepkg"
-	"unstable.build/rune/internal/ide/idepkg/pkgrpc"
 	"unstable.build/rune/internal/ide/idepkg/pkgtrust"
-	"unstable.build/rune/internal/llm/llmrpc"
 	"unstable.build/rune/internal/rpc"
 	"unstable.build/rune/internal/term/gui"
 	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/workspace"
-	"unstable.build/rune/internal/workspace/workspacerpc"
 	"unstable.build/rune/internal/workspace/workspacessh"
 )
 
@@ -106,6 +98,10 @@ var (
 	// marked hidden
 	flagWorkspaceServer = flag.StringP("workspace-server", "x", "",
 		"Run a workspace server from standard input and output")
+	flagDaemon = flag.Bool("daemon", false,
+		"Run --headless as a workspace server another Rune started on "+
+			"demand: log to the server log, and exit quietly when "+
+			"another instance already holds the lock")
 	flagHTTPAddress = flag.String("rune-http-address", apicfg.HTTPEndpointAddress,
 		"Rune HTTP API endpoint host/port pair")
 	flagGRPCAddress = flag.String("rune-grpc-address", apicfg.GRPCEndpointAddress,
@@ -181,126 +177,6 @@ func cwdURI() workspaceapi.URI {
 	return uri
 }
 
-func startWorkspaceServer(host *hostenv.Host, shellRCDir string, shellRCErr error) int {
-	var logger *slog.Logger
-
-	// The log defaults to <default datadir>/server.log; when the datadir is
-	// overridden without an explicit --workspace-server-log, keep the log
-	// beside the rest of the server state. debug.StartPProfOnSignal writes the
-	// pprof HTTP address here on SIGUSR1.
-	serverLogs := *flagWorkspaceServerLogFile
-	if !flag.Lookup("workspace-server-log").Changed {
-		serverLogs = filepath.Join(*flagDataPath, "server.log")
-	}
-	f, err := workspace.OpenFile(serverLogs,
-		os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.SetOutput(f)
-	log.SetLevel(log.InfoLevel)
-	log.SetFormatter(logging.LogrusLogdFormatter{})
-	rpc.EnableGRPCLogging(f, f, f)
-	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-	defer f.Close()
-	defer func() {
-		_ = f.Sync()
-	}()
-	slog.SetDefault(logger)
-
-	log.Tracef("Initialized debug logger")
-
-	// log unhandled signals for debugging
-	ch := make(chan os.Signal, 1)
-	quitch := make(chan struct{})
-	grpcServer := workspacessh.NewSchemeServer(
-		grpc.ChainUnaryInterceptor(
-			rpc.UnaryReportRecoveryInterceptor(),
-		),
-		grpc.ChainStreamInterceptor(
-			rpc.StreamReportRecoveryInterceptor(),
-		),
-		grpc.MaxRecvMsgSize(llmrpc.MaxRecvMsgSize),
-		grpc.MaxSendMsgSize(llmrpc.MaxSendMsgSize),
-	)
-	signal.Notify(ch)
-
-	defer close(quitch)
-	defer signal.Reset()
-
-	go debug.CapturePanicReport(func() {
-		defer grpcServer.Stop()
-		for {
-			select {
-			case sig := <-ch:
-				switch sig {
-				case syscall.SIGTERM, syscall.SIGINT:
-					log.Infof("Received %v signal: cleaning up...", sig)
-					return
-				case syscall.SIGKILL:
-					log.Info("Received SIGKILL signal: exiting")
-					os.Exit(1)
-				default:
-					if isUrgentDataSignal(sig) {
-						break
-					}
-					log.Debugf("Received unhandled signal: %#v", sig)
-				}
-			case <-quitch:
-				return
-			}
-		}
-	})
-
-	uri, err := workspaceapi.CurrentUserHostURI(*flagWorkspaceServer)
-	if err != nil {
-		log.Error(err)
-		return 2
-	}
-
-	if shellRCErr != nil {
-		reportRemoteShellRCErr(os.Stderr, shellRCErr)
-	}
-	newScheme := workspace.NewFileSchemeFunc(*flagDataPath, shellRCDir)
-
-	scheme, err := newScheme(context.Background(), config.NopConfig(), uri)
-	if err != nil {
-		log.Error(err)
-		return 3
-	}
-	defer scheme.Close()
-	// Apply gui.env before serving so the tools the client starts here
-	// see the packages installed on this host.
-	loadRemoteConfigAndApplyEnv(host, scheme, uri)
-
-	// The client installs the packages its workspace needs on this host
-	// through this manager, served next to the workspace.
-	pkgs, pkgStorage := newHostPackageManager(newRuneStorage(*flagDataPath),
-		newRemoteReleaseManager(), scheme,
-		func() { loadRemoteConfigAndApplyEnv(host, scheme, uri) })
-	defer func() {
-		_ = pkgStorage.Close()
-	}()
-	pkgrpc.NewServer(pkgs).Register(grpcServer)
-
-	server := workspacerpc.NewServer(scheme,
-		workspacerpc.CommandAuthorizerFunc(
-			func(context.Context, workspaceapi.Cmd) error { return nil }))
-	defer func() {
-		_ = server.Stop()
-	}()
-
-	err = workspacessh.StartSchemeServer(log.StandardLogger(), server, grpcServer)
-	if err != nil {
-		log.Error(err)
-		return 4
-	}
-	log.Tracef("StartSchemeServer returned with no error")
-	return 0
-}
-
 func main() {
 	if err := flag.CommandLine.MarkHidden("rune-http-address"); err != nil {
 		panic(err)
@@ -315,6 +191,9 @@ func main() {
 		panic(err)
 	}
 	if err := flag.CommandLine.MarkHidden("workspace-server-log"); err != nil {
+		panic(err)
+	}
+	if err := flag.CommandLine.MarkHidden("daemon"); err != nil {
 		panic(err)
 	}
 	if err := flag.CommandLine.MarkHidden("rune-release-collection"); err != nil {
@@ -337,7 +216,8 @@ func main() {
 
 	// If no manual tui/gui flag was set, assume we were launched as a desktop
 	// app and inject the same defaults the platform launcher would normally pass.
-	if !*flagGUI && !*flagTUI && !*flagHeadless && *flagWorkspaceServer == "" {
+	if !*flagGUI && !*flagTUI && !*flagHeadless && !*flagDaemon &&
+		*flagWorkspaceServer == "" {
 		if err := os.MkdirAll(*flagDataPath, 0777); err != nil {
 			fmt.Fprintf(os.Stderr, "mkdir datadir %q: %s",
 				*flagDataPath, err)
@@ -415,9 +295,11 @@ func appLaunchArgs(goos string) ([]string, bool) {
 // asked for.
 var headlessFlags = map[string]bool{
 	"headless":                true,
+	"daemon":                  true,
 	"version":                 true,
 	"config":                  true,
 	"datadir":                 true,
+	"workspace-server-log":    true,
 	"rune-http-address":       true,
 	"rune-grpc-address":       true,
 	"rune-grpc-insecure":      true,
@@ -445,6 +327,9 @@ func checkModeArgs(
 			strings.Join(modes, " "))
 	}
 	if !headless {
+		if fs.Changed("daemon") {
+			return errors.New("--daemon only applies to --headless")
+		}
 		return nil
 	}
 

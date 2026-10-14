@@ -87,7 +87,9 @@ environment a package sets up, such as `GOROOT`, applies to the
 terminals and tools started after the install, with no restart.
 
 **Leave `network.auto_join` on.** It is the default. A headless node has
-no console to run `network up` in, so with it off Rune says so and exits.
+no console to run `network up` in, so with it off it never joins: it
+still keeps the terminals of the editors running on the machine, but no
+other machine can reach it.
 A stable name is worth setting when the host's own name is not one you
 would type, which is always the case in a container:
 
@@ -425,8 +427,17 @@ The [network limits](./network.md#how-many-machines-you-can-have) are
 
 ## Troubleshooting
 
-**`network.auto_join is off in ~/.rune/config.yaml`.** Set it to `true`
-in the host's config; a headless node has no other way to join.
+**`network.auto_join is off` in the log.** The node runs but never joins,
+so it is missing from `network peers`. Set it to `true` in the host's
+config; a headless node has no other way to join.
+
+**`there's another instance of Rune holding the lock`.** Another Rune
+already serves this machine from the same data directory: a second
+service, or the server an editor on the machine started because none was
+running. Only one may run. Stop the process whose ID the message names,
+which ends the terminals it holds, and restart the service at once:
+editors on the machine use its server from then on, but one that needs
+a terminal while no server runs starts its own again.
 
 **`could not join the network` right after boot.** The machine was not
 online yet. The recipes restart the node on failure, so it joins on the

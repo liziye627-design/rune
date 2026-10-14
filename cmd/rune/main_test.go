@@ -63,6 +63,17 @@ func TestCheckModeArgs(t *testing.T) {
 			files:   []string{"a.go"},
 			wantErr: "--headless does not take file arguments",
 		},
+		{name: "headless daemon spawned by a client", args: []string{"--headless", "--daemon", "-d", "/d"}},
+		{
+			name:    "daemon without headless",
+			args:    []string{"--daemon"},
+			wantErr: "--daemon only applies to --headless",
+		},
+		{
+			name:    "daemon with another mode",
+			args:    []string{"--tui", "--daemon"},
+			wantErr: "--daemon only applies to --headless",
+		},
 	}
 
 	for _, tt := range tests {
@@ -133,6 +144,7 @@ func parseModeFlags(
 	guiFlag := fs.BoolP("gui", "G", false, "")
 	tuiFlag := fs.Bool("tui", false, "")
 	headlessFlag := fs.Bool("headless", false, "")
+	fs.Bool("daemon", false, "")
 	fs.StringP("config", "c", "", "")
 	fs.StringP("datadir", "d", "", "")
 	fs.StringP("workspace", "w", "", "")

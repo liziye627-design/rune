@@ -38,6 +38,7 @@ import (
 	"unstable.build/rune/internal/ide/hostenv"
 	"unstable.build/rune/internal/runenet"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/workspaceserver"
 )
 
 // headlessClient is the subset of *apiclient.Client a headless node
@@ -49,11 +50,21 @@ type headlessClient interface {
 	Logout(ctx context.Context) error
 }
 
-// runHeadless serves this machine's workspaces on the Rune network with
-// no editor at all: no IDE, no terminal UI and no window. Everything the
-// operator would otherwise read out of the editor — the sign-in code, the
-// account, the node's mesh status — goes to stdout, and the editor log
-// is teed there too so the process is usable under a service manager.
+// runHeadless runs this machine's workspace server with no editor at
+// all: no IDE, no terminal UI and no window. It owns the terminals of
+// every workspace on the machine, so they outlive every Rune client,
+// and it is the one process that may serve them: a second one fails on
+// the data directory's lock.
+//
+// Run by an operator, it also serves the machine on the Rune network
+// when network.auto_join is set. Everything the operator would
+// otherwise read out of the editor — the sign-in code, the account,
+// the node's mesh status — goes to stdout, and the editor log is teed
+// there too so the process is usable under a service manager.
+//
+// Spawned on demand by a Rune (--daemon), it logs to the server log
+// and treats a lock another instance holds as the server it was asked
+// to start: whoever spawned it connects to that one.
 func runHeadless(
 	ctx context.Context, host *hostenv.Host, shellRCDir string, shellRCErr error,
 ) int {
@@ -63,7 +74,12 @@ func runHeadless(
 		return 1
 	}
 
-	closeLog, err := startHeadlessLogging(rootCfg, os.Stdout)
+	var closeLog func()
+	if *flagDaemon {
+		closeLog, err = startServerLog()
+	} else {
+		closeLog, err = startHeadlessLogging(rootCfg, os.Stdout)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		return 1
@@ -79,53 +95,108 @@ func runHeadless(
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		return 1
 	}
-	// A headless node exists to be on the network and has no console to
-	// bring it up later, so auto_join being off leaves nothing to run.
-	if !netCfg.AutoJoin {
-		fmt.Fprintf(os.Stderr,
-			"network.auto_join is off in %s, so --headless has nothing to "+
-				"serve; set it to true to run a headless node\n",
-			*flagConfigPath)
-		return 1
+	applyConfigEnv(host, rootCfg)
+
+	// The socket answers before the server is done starting, so a
+	// signal that lands in between must still stop it the clean way.
+	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+	server, err := startMachineServer(shellRCDir)
+	if err != nil {
+		if *flagDaemon && errors.Is(err, workspaceserver.ErrLocked) {
+			log.Infof("not starting a workspace server: %v", err)
+			return 0
+		}
+		return headlessFailure(err)
+	}
+	defer func() {
+		_ = server.Close()
+	}()
+	log.Infof("serving this machine's workspaces on %s",
+		workspaceserver.SocketPath(*flagDataPath))
+
+	switch {
+	case *flagDaemon:
+	case !netCfg.AutoJoin:
+		// An operator reads this where a headless node used to refuse
+		// to start: nothing else says why it never joins.
+		log.Infof("network.auto_join is off in %s: serving this machine only, "+
+			"not joining the Rune network", *flagConfigPath)
+	default:
+		closeNet, err := startHeadlessNetwork(ctx, rootCfg, host, shellRCDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			return 1
+		}
+		defer closeNet()
 	}
 
+	waitForShutdown(ctx, server.Done())
+	// A second signal kills a server stuck cleaning up.
+	stopSignals()
+	if err := server.Err(); err != nil {
+		return headlessFailure(fmt.Errorf("workspace server stopped: %w", err))
+	}
+	return 0
+}
+
+// headlessFailure reports why the server could not run where whoever
+// started it looks: the server log for a spawned one, whose standard
+// error nobody reads, and standard error for an operator's, whose log
+// already goes to standard output.
+func headlessFailure(err error) int {
+	if *flagDaemon {
+		log.Error(err)
+	} else {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	return 1
+}
+
+// startHeadlessNetwork signs the machine in and joins the Rune network,
+// serving this machine's workspaces to its peers until the returned
+// function is called.
+func startHeadlessNetwork(
+	ctx context.Context, rootCfg config.Config, host *hostenv.Host, shellRCDir string,
+) (func(), error) {
 	storage := newRuneStorage(*flagDataPath)
 	apicfg := apiClientConfig(os.TempDir(), rootCfg)
 	apicfg.Headless = true
 	client := apiclient.New(storage, apicfg, *flagDataPath)
-	defer client.Close()
 
 	if err := headlessLogin(ctx, client, os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "login: %s\n", err)
-		return 1
+		client.Close()
+		return nil, fmt.Errorf("login: %w", err)
 	}
 
 	net := newNetwork(rootCfg, *flagDataPath, shellRCDir, newNetworkGate(client))
-	defer func() {
+	closeNet := func() {
 		_ = net.Close()
-	}()
+		client.Close()
+	}
 
 	closePackages, err := serveHeadlessPackages(ctx, net, storage, host, shellRCDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err)
-		return 1
+		closeNet()
+		return nil, err
 	}
-	defer closePackages()
+	closeAll := func() {
+		closePackages()
+		closeNet()
+	}
 
 	if err := net.join(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "could not join the network: %s\n", err)
-		return 1
+		closeAll()
+		return nil, fmt.Errorf("could not join the network: %w", err)
 	}
 
 	st, err := net.node.Status(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "network status: %s\n", err)
-		return 1
+		closeAll()
+		return nil, fmt.Errorf("network status: %w", err)
 	}
 	fmt.Fprint(os.Stdout, formatNodeStatus(st))
-
-	waitForShutdownSignal(ctx)
-	return 0
+	return closeAll, nil
 }
 
 // serveHeadlessPackages has peers install packages on this machine
@@ -334,15 +405,17 @@ func formatNodeStatus(st runenet.Status) string {
 	return b.String()
 }
 
-// waitForShutdownSignal blocks until the service manager (or the
-// operator) asks the node to stop, or ctx is cancelled.
-func waitForShutdownSignal(ctx context.Context) {
+// waitForShutdown blocks until the service manager (or the operator)
+// asks the server to stop, the server stops on its own, or ctx is
+// cancelled.
+func waitForShutdown(ctx context.Context, stopped <-chan struct{}) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(ch)
 	select {
 	case sig := <-ch:
 		log.Infof("Received %v signal: cleaning up...", sig)
+	case <-stopped:
 	case <-ctx.Done():
 	}
 }

@@ -26,8 +26,10 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -530,18 +532,66 @@ func TestFormatNodeStatus(t *testing.T) {
 	}
 }
 
-func TestWaitForShutdownSignalReturnsOnCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go debug.CapturePanicReport(func() {
-		waitForShutdownSignal(ctx)
-		close(done)
-	})
+func TestWaitForShutdown(t *testing.T) {
+	// A SIGTERM that lands before waitForShutdown installs its handler
+	// would otherwise kill the test binary.
+	guard := make(chan os.Signal, 16)
+	signal.Notify(guard, syscall.SIGTERM)
+	t.Cleanup(func() { signal.Stop(guard) })
 
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("waitForShutdownSignal did not return after the context was cancelled")
+	for _, tc := range []struct {
+		name    string
+		trigger func(cancel context.CancelFunc, stopped chan struct{}, done <-chan struct{})
+	}{
+		{
+			name: "context cancelled",
+			trigger: func(cancel context.CancelFunc, _ chan struct{}, _ <-chan struct{}) {
+				cancel()
+			},
+		},
+		{
+			name: "server stopped on its own",
+			trigger: func(_ context.CancelFunc, stopped chan struct{}, _ <-chan struct{}) {
+				close(stopped)
+			},
+		},
+		{
+			name: "terminated by the service manager",
+			trigger: func(_ context.CancelFunc, _ chan struct{}, done <-chan struct{}) {
+				// Resent until it lands, because nothing observable
+				// says when the handler is in place.
+				for {
+					require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+					select {
+					case <-done:
+						return
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stopped := make(chan struct{})
+			done := make(chan struct{})
+			go debug.CapturePanicReport(func() {
+				waitForShutdown(ctx, stopped)
+				close(done)
+			})
+
+			triggered := make(chan struct{})
+			go debug.CapturePanicReport(func() {
+				defer close(triggered)
+				tc.trigger(cancel, stopped, done)
+			})
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("waitForShutdown did not return")
+			}
+			<-triggered
+		})
 	}
 }
