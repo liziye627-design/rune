@@ -204,6 +204,14 @@ func (a *Client) CachedTokenSource() *auth.CachedTokenSource {
 	return a.tokenSource
 }
 
+// ReloadToken drops the in-memory account token so the next read
+// comes from the shared data directory. The workspace server reads the
+// token the editor's `login` writes there, and must call this before
+// each read that has to honour a login or logout it did not perform.
+func (a *Client) ReloadToken() {
+	a.tokenSource.Reload()
+}
+
 // Logout purges the user's underlying authentication credentials,
 // so next requests sent to the server via the connections created via NewConn
 // will be un-authenticated.

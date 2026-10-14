@@ -88,6 +88,17 @@ func (l *CachedTokenSource) Purge() error {
 	return l.storage.Delete(ctx, tokenDocumentID)
 }
 
+// Reload drops the in-memory token so the next read hydrates from
+// storage again. Storage is shared between processes while the memory
+// copy is not, so a process that merely reads the token — never signs
+// in — calls this before a read that must reflect a login or logout
+// another process performed.
+func (l *CachedTokenSource) Reload() {
+	l.mu.Lock()
+	l.token = nil
+	l.mu.Unlock()
+}
+
 // Cached returns the cached oauth2 token without triggering a refresh
 // or a new oauth2 browser flow. If no token has been loaded into
 // memory yet, it lazily hydrates from the storage partition. Returns

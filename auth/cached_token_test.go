@@ -501,6 +501,37 @@ func TestCachedTokenCached(t *testing.T) {
 			got.Expiry.Truncate(time.Second), 0)
 		assert.Equal(t, int32(0), sourcer.called.Load())
 	})
+
+	// Storage is shared between processes; the memory copy is not. A
+	// process that only reads the token sees another process's login
+	// or logout only after it drops what it hydrated the first time.
+	t.Run("Reload picks up a token written to storage after the first read", func(t *testing.T) {
+		svc := storagestub.NewInMemoryService()
+		source := NewCachedTokenSource(nil, svc)
+		write := func(access string) {
+			t.Helper()
+			require.NoError(t, svc.Set(context.Background(), tokenDocumentID,
+				newStoredToken(&oauth2.Token{
+					AccessToken: access,
+					Expiry:      time.Now().Add(30 * time.Minute),
+				})))
+		}
+		write("first-login")
+		require.Equal(t, "first-login", source.Cached(context.Background()).AccessToken)
+
+		write("written-elsewhere")
+		assert.Equal(t, "first-login", source.Cached(context.Background()).AccessToken,
+			"the memory copy is what a plain read answers from")
+
+		source.Reload()
+		assert.Equal(t, "written-elsewhere", source.Cached(context.Background()).AccessToken)
+
+		require.NoError(t, svc.Delete(context.Background(), tokenDocumentID))
+		assert.NotNil(t, source.Cached(context.Background()),
+			"the memory copy outlives the stored one")
+		source.Reload()
+		assert.Nil(t, source.Cached(context.Background()))
+	})
 }
 
 func TestGetTokenDoesNotBlockPurge(t *testing.T) {
