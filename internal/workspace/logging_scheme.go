@@ -18,6 +18,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"os"
 	"syscall"
 
@@ -236,5 +237,87 @@ func (t loggingScheme) Close() (err error) {
 	t.trace("Close")
 	err = t.other.Close()
 	t.trace("Close: %q", err)
+	return
+}
+
+// The optional host capabilities are forwarded rather than promoted:
+// tracing a scheme must not change what it can do.
+
+// OnDisconnect satisfies [RemoteScheme]; it is nil for a scheme whose
+// transport cannot drop.
+func (t loggingScheme) OnDisconnect() <-chan struct{} {
+	if rs, ok := t.other.(RemoteScheme); ok {
+		return rs.OnDisconnect()
+	}
+	return nil
+}
+
+// WaitConnected satisfies [RemoteScheme].
+func (t loggingScheme) WaitConnected(ctx context.Context) (err error) {
+	rs, ok := t.other.(RemoteScheme)
+	if !ok {
+		return nil
+	}
+	t.trace("WaitConnected()")
+	err = rs.WaitConnected(ctx)
+	t.trace("WaitConnected(): %v", err)
+	return
+}
+
+// InstallDataDir satisfies [InstallDataDirProvider].
+func (t loggingScheme) InstallDataDir(ctx context.Context) (dir string, err error) {
+	p, ok := t.other.(InstallDataDirProvider)
+	if !ok {
+		return "", errors.ErrUnsupported
+	}
+	t.trace("InstallDataDir()")
+	dir, err = p.InstallDataDir(ctx)
+	t.trace("InstallDataDir(): %q, %v", dir, err)
+	return
+}
+
+// CreateVTE satisfies [VTEOwner].
+func (t loggingScheme) CreateVTE(ctx context.Context, opts CreateVTEOptions) (
+	v VTE, err error,
+) {
+	t.trace("CreateVTE(%v)", opts.CommandAndArgs)
+	o, err := AsVTEOwner(t.other)
+	if err == nil {
+		v, err = o.CreateVTE(ctx, opts)
+	}
+	t.trace("CreateVTE(%v): %v", opts.CommandAndArgs, err)
+	return
+}
+
+// ListVTEs satisfies [VTEOwner].
+func (t loggingScheme) ListVTEs(ctx context.Context) (infos []VTEInfo, err error) {
+	t.trace("ListVTEs()")
+	o, err := AsVTEOwner(t.other)
+	if err == nil {
+		infos, err = o.ListVTEs(ctx)
+	}
+	t.trace("ListVTEs(): %d, %v", len(infos), err)
+	return
+}
+
+// AttachVTE satisfies [VTEOwner].
+func (t loggingScheme) AttachVTE(ctx context.Context, id VTEID) (v VTE, err error) {
+	t.trace("AttachVTE(%s)", id)
+	o, err := AsVTEOwner(t.other)
+	if err == nil {
+		v, err = o.AttachVTE(ctx, id)
+	}
+	t.trace("AttachVTE(%s): %v", id, err)
+	return
+}
+
+// DeleteVTE satisfies [VTEOwner].
+func (t loggingScheme) DeleteVTE(ctx context.Context, id VTEID) (err error) {
+	t.trace("DeleteVTE(%s)", id)
+	o, err := AsVTEOwner(t.other)
+	if err == nil {
+		err = o.DeleteVTE(ctx, id)
+	}
+	t.trace("DeleteVTE(%s): %v", id, err)
 	return
 }
