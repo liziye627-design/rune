@@ -16,59 +16,15 @@
 
 package vte
 
-import (
-	"github.com/unstablebuild/rune-go-sdk/term"
-)
+import "unstable.build/rune/internal/workspace"
 
 const terminalSnapshotVersion = 1
 
 // Snapshot is a durable representation of a terminal's rendered state.
-//
-// It intentionally captures terminal output and screen state, not the live
-// process attached to the pty. This mirrors tmux's distinction between an
-// in-memory pane grid/history and process respawn: saved snapshots can restore
-// output/history, but cannot continue the original process after Rune exits.
-//
-// Exactly one of Primary or Alternate is populated, matching the buffer
-// that was active at snapshot time. Reading both cells and cursor under
-// one mutex acquire — instead of through separate component accessors —
-// is what callers like vteprobe rely on to keep the two consistent
-// across parser callbacks.
-type Snapshot struct {
-	// Schema is the on-disk snapshot format version, bumped only when
-	// the persisted layout changes. Version is the live grid revision
-	// from the source Component, used by callers to detect whether the
-	// rendered grid changed between snapshots; it is not part of the
-	// durable format's compatibility contract.
-	Schema  int
-	Version uint64
-	Title   string
-	Width   int
-	Height  int
-
-	ScrollOffset term.Coordinates
-	Primary      ScreenSnapshot
-	Alternate    ScreenSnapshot
-}
-
-// ActiveCells returns the cells of the buffer that was active when the
-// snapshot was taken (Alternate when populated, Primary otherwise).
-func (s Snapshot) ActiveCells() [][]term.Cell {
-	return term.CloneCells(s.Active().Cells)
-}
-
-// Active returns the ScreenSnapshot of the buffer that was active when
-// the snapshot was taken: Alternate when its Cells are populated,
-// otherwise Primary.
-func (s Snapshot) Active() ScreenSnapshot {
-	if len(s.Alternate.Cells) != 0 {
-		return s.Alternate
-	}
-	return s.Primary
-}
+// It belongs to the scheme that owns the emulator, so it is defined
+// where the terminal lifecycle is: see [workspace.VTESnapshot].
+type Snapshot = workspace.VTESnapshot
 
 // ScreenSnapshot is the rendered state of one VTE screen buffer.
-type ScreenSnapshot struct {
-	Cells  [][]term.Cell
-	Cursor term.Coordinates
-}
+// See [workspace.VTEScreenSnapshot].
+type ScreenSnapshot = workspace.VTEScreenSnapshot

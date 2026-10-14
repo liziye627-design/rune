@@ -138,6 +138,8 @@ func (t *testFileBuffer) Close() error {
 }
 
 type testLoader struct {
+	workspacetest.NopVTEOwner
+
 	buf *testFileBuffer
 	// exitStartedCommands makes StartCommand's stub process exit
 	// immediately with success, mirroring the Executor contract that

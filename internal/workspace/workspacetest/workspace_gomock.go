@@ -47,6 +47,21 @@ func (m *MockWorkspace) EXPECT() *MockWorkspaceMockRecorder {
 	return m.recorder
 }
 
+// AttachVTE mocks base method.
+func (m *MockWorkspace) AttachVTE(arg0 context.Context, arg1 workspace.VTEID) (workspace.VTE, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AttachVTE", arg0, arg1)
+	ret0, _ := ret[0].(workspace.VTE)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// AttachVTE indicates an expected call of AttachVTE.
+func (mr *MockWorkspaceMockRecorder) AttachVTE(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AttachVTE", reflect.TypeOf((*MockWorkspace)(nil).AttachVTE), arg0, arg1)
+}
+
 // Chroot mocks base method.
 func (m *MockWorkspace) Chroot(path string) (schemeapi.Scheme, error) {
 	m.ctrl.T.Helper()
@@ -91,6 +106,35 @@ func (mr *MockWorkspaceMockRecorder) Create(filename any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Create", reflect.TypeOf((*MockWorkspace)(nil).Create), filename)
 }
 
+// CreateVTE mocks base method.
+func (m *MockWorkspace) CreateVTE(arg0 context.Context, arg1 workspace.CreateVTEOptions) (workspace.VTE, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CreateVTE", arg0, arg1)
+	ret0, _ := ret[0].(workspace.VTE)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CreateVTE indicates an expected call of CreateVTE.
+func (mr *MockWorkspaceMockRecorder) CreateVTE(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateVTE", reflect.TypeOf((*MockWorkspace)(nil).CreateVTE), arg0, arg1)
+}
+
+// DeleteVTE mocks base method.
+func (m *MockWorkspace) DeleteVTE(arg0 context.Context, arg1 workspace.VTEID) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteVTE", arg0, arg1)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DeleteVTE indicates an expected call of DeleteVTE.
+func (mr *MockWorkspaceMockRecorder) DeleteVTE(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteVTE", reflect.TypeOf((*MockWorkspace)(nil).DeleteVTE), arg0, arg1)
+}
+
 // InstallDataDir mocks base method.
 func (m *MockWorkspace) InstallDataDir(ctx context.Context) (string, error) {
 	m.ctrl.T.Helper()
@@ -122,6 +166,21 @@ func (m *MockWorkspace) Join(elem ...string) string {
 func (mr *MockWorkspaceMockRecorder) Join(elem ...any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Join", reflect.TypeOf((*MockWorkspace)(nil).Join), elem...)
+}
+
+// ListVTEs mocks base method.
+func (m *MockWorkspace) ListVTEs(arg0 context.Context) ([]workspace.VTEInfo, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListVTEs", arg0)
+	ret0, _ := ret[0].([]workspace.VTEInfo)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListVTEs indicates an expected call of ListVTEs.
+func (mr *MockWorkspaceMockRecorder) ListVTEs(arg0 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListVTEs", reflect.TypeOf((*MockWorkspace)(nil).ListVTEs), arg0)
 }
 
 // Load mocks base method.

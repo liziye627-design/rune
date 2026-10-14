@@ -36,9 +36,10 @@ import (
 )
 
 // stubWorkspace wraps workspacetest.NopScheme to satisfy
-// workspace.Workspace (which adds the Loader methods).
+// workspace.Workspace (which adds the Loader and terminal methods).
 type stubWorkspace struct {
 	*workspacetest.NopScheme
+	workspacetest.NopVTEOwner
 }
 
 func newStubWorkspace() workspace.Workspace {

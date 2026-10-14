@@ -31,7 +31,8 @@ import (
 
 // Workspace binds a Loader and a Scheme together for use in internal
 // packages that both need to share an API with external resources
-// and use a Loader to load resources into buffers.
+// and use a Loader to load resources into buffers, along with the
+// host-only capabilities a scheme may provide.
 type Workspace interface {
 	Loader
 	schemeapi.Scheme
@@ -41,6 +42,7 @@ type Workspace interface {
 	// true when the host cannot tell, so callers keep comparing paths
 	// exactly. The answer is fixed for the workspace's lifetime.
 	PathCaseSensitive() bool
+	VTEOwner
 }
 
 // RemoteScheme is implemented by schemes whose underlying transport

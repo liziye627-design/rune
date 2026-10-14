@@ -79,6 +79,7 @@ func TestWorkspaceResourcesUsesStartCommandAuthorizer(t *testing.T) {
 
 type testWorkspace struct {
 	*workspacetest.NopScheme
+	workspacetest.NopVTEOwner
 }
 
 func (t *testWorkspace) Load(

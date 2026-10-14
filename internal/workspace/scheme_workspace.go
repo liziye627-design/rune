@@ -169,6 +169,40 @@ func logProbe(msg string, args ...any) {
 		Debugf(msg, args...)
 }
 
+func (w *schemeWorkspace) CreateVTE(
+	ctx context.Context, opts CreateVTEOptions,
+) (VTE, error) {
+	o, err := AsVTEOwner(w.Scheme)
+	if err != nil {
+		return nil, err
+	}
+	return o.CreateVTE(ctx, opts)
+}
+
+func (w *schemeWorkspace) ListVTEs(ctx context.Context) ([]VTEInfo, error) {
+	o, err := AsVTEOwner(w.Scheme)
+	if err != nil {
+		return nil, err
+	}
+	return o.ListVTEs(ctx)
+}
+
+func (w *schemeWorkspace) AttachVTE(ctx context.Context, id VTEID) (VTE, error) {
+	o, err := AsVTEOwner(w.Scheme)
+	if err != nil {
+		return nil, err
+	}
+	return o.AttachVTE(ctx, id)
+}
+
+func (w *schemeWorkspace) DeleteVTE(ctx context.Context, id VTEID) error {
+	o, err := AsVTEOwner(w.Scheme)
+	if err != nil {
+		return err
+	}
+	return o.DeleteVTE(ctx, id)
+}
+
 // NewSchemeWorkspace wraps a schemeapi.Scheme and implements a workspace.Loader,
 // effectively converting a schemeapi.Scheme into a workspace.Workspace.
 //
