@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+option go_package = "/vterpc";
+
+package workspacevte;
+
+// VTE is the repository-private lifecycle surface for canonical
+// workspace terminal emulators. It is an implementation detail beneath
+// workspace.Workspace and is deliberately absent from the public SDK.
+//
+// Only lifecycle lives here, because only lifecycle is request and
+// response. An attachment is a raw byte stream between a client's
+// emulator and a pty; it has a transport of its own (see
+// workspace/vtewire).
+service VTE {
+	rpc List(ListRequest) returns (ListResponse) {};
+	rpc Delete(DeleteRequest) returns (DeleteResponse) {};
+}
+
+message Info {
+	string id = 1;
+	string title = 2;
+	repeated string command_and_args = 3;
+	int32 width = 4;
+	int32 height = 5;
+	int32 attachments = 6;
+	bool complete = 7;
+	int64 created_at_unix_nano = 8;
+}
+
+// root scopes a request to one workspace: a server hosts the terminals
+// of every workspace on its machine, and each only sees its own. Empty
+// means the server's own root.
+message ListRequest {
+	string root = 1;
+}
+
+message ListResponse {
+	repeated Info vtes = 1;
+}
+
+message DeleteRequest {
+	string id = 1;
+	string root = 2;
+}
+
+message DeleteResponse {}

@@ -23,7 +23,6 @@ import (
 	"os"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi/workspacerpc"
 	"google.golang.org/grpc"
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/workspace/remotescheme"
@@ -55,10 +54,7 @@ func StartSchemeServer(
 				grpcServer.Stop()
 			})
 		})
-	workspacerpc.RegisterSchemeServer(grpcServer, server)
-	workspacerpc.RegisterFilesServer(grpcServer, server)
-	workspacerpc.RegisterExecutorServer(grpcServer, server)
-	workspacerpc.RegisterTerminalServer(grpcServer, server)
+	tworkspacerpc.RegisterServices(grpcServer, server)
 	if line, err := encodeServerReady(); err == nil {
 		_, _ = os.Stderr.WriteString(line)
 	}
