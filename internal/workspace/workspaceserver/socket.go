@@ -68,6 +68,16 @@ func VTESocketPath(dataDir string) string {
 	return filepath.Join(SocketDir(dataDir), "rune.vte.sock")
 }
 
+// NetSocketPath returns the socket through which clients of the
+// workspace server of dataDir reach peers on the Rune network.
+//
+// The server hosts the machine's network node, and a connection to a
+// peer is a raw byte stream, not a request and a response, so like
+// terminal attachments it gets a socket of its own beside the RPC one.
+func NetSocketPath(dataDir string) string {
+	return filepath.Join(SocketDir(dataDir), "rune.net.sock")
+}
+
 // Listen binds the workspace server socket at path.
 //
 // A socket left behind by a server that died without unlinking it is
