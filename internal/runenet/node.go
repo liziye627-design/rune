@@ -562,10 +562,31 @@ func (n *Node) ListenPort(port int) (net.Listener, error) {
 	return n.srv.Listen("tcp", fmt.Sprintf(":%d", port))
 }
 
+// AttachmentPort is the mesh port terminal attachments are served on,
+// given the workspace port. Attachments are a raw byte stream between
+// a client's emulator and a pty rather than a request and a response,
+// so they get a listener of their own beside the RPC one, exactly as
+// they do on the workspace server's local sockets.
+func AttachmentPort(port int) int {
+	return port + 1
+}
+
+// ListenAttachments accepts terminal attachment connections from mesh
+// peers; see [AttachmentPort].
+func (n *Node) ListenAttachments() (net.Listener, error) {
+	return n.ListenPort(AttachmentPort(n.cfg.Port))
+}
+
 // Dial opens a connection to host's workspace port. host is either a
 // peer name as reported by [Node.Peers] or a mesh IP address.
 func (n *Node) Dial(ctx context.Context, host string) (net.Conn, error) {
 	return n.DialPort(ctx, host, n.cfg.Port)
+}
+
+// DialAttachment opens a connection to host's terminal attachment
+// port; see [AttachmentPort].
+func (n *Node) DialAttachment(ctx context.Context, host string) (net.Conn, error) {
+	return n.DialPort(ctx, host, AttachmentPort(n.cfg.Port))
 }
 
 // DialPort opens a connection to port on host, which is named as for

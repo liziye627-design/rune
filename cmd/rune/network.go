@@ -344,6 +344,13 @@ func (g gatedMesh) Dial(ctx context.Context, peer string) (net.Conn, error) {
 	return g.n.node.Dial(ctx, peer)
 }
 
+func (g gatedMesh) DialAttachment(ctx context.Context, peer string) (net.Conn, error) {
+	if err := g.n.check(ctx); err != nil {
+		return nil, err
+	}
+	return g.n.node.DialAttachment(ctx, peer)
+}
+
 // gatedNetwork is what the `network` command operates on: the two
 // subcommands that need the mesh check the plan first, so a user
 // without one is told how to get it instead of being told the node is

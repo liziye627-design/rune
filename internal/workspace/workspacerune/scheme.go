@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -44,6 +45,7 @@ import (
 	"unstable.build/rune/internal/runenet/runenetpb"
 	"unstable.build/rune/internal/workspace"
 	"unstable.build/rune/internal/workspace/remotescheme"
+	"unstable.build/rune/internal/workspace/vtescheme"
 )
 
 // Scheme is the URL scheme implemented by this package.
@@ -56,11 +58,14 @@ var ErrConnectionClosed = errors.New("network connection closed unexpectedly")
 var _ workspace.RemoteScheme = (*scheme)(nil)
 var _ workspace.InstallDataDirProvider = (*scheme)(nil)
 var _ workspace.PackageHost = (*scheme)(nil)
+var _ workspace.VTEOwner = (*scheme)(nil)
 
-// Dialer opens a connection to a peer's workspace server. It is
-// satisfied by [runenet.Node].
+// Dialer opens connections to a peer's workspace server: one to its
+// RPC surface and, per terminal, one to its attachment stream. It is
+// satisfied by [runenet.Node] and by meshdial.Dialer.
 type Dialer interface {
 	Dial(ctx context.Context, peer string) (net.Conn, error)
+	DialAttachment(ctx context.Context, peer string) (net.Conn, error)
 }
 
 // New returns a scheme constructor for rune:// workspaces served by
@@ -192,7 +197,14 @@ func (s *scheme) connectScheme(
 		_ = conn.Close()
 		return nil, fmt.Errorf("open %s on %s: %w", s.path, s.peer, err)
 	}
-	return &connScheme{Scheme: workspaceCwd{Scheme: remote}, conn: conn}, nil
+	// The peer's terminals belong to its workspace server, not to this
+	// connection, which is what lets them outlive it: each attachment
+	// is a stream of its own to the peer's attachment port.
+	dial := func(ctx context.Context) (io.ReadWriteCloser, error) {
+		return s.dialer.DialAttachment(ctx, s.peer)
+	}
+	terminals := vtescheme.NewConnClient(workspaceCwd{Scheme: remote}, conn, dial)
+	return &connScheme{Scheme: terminals, conn: conn}, nil
 }
 
 // workspaceCwd runs commands in the workspace directory. A peer serves
@@ -270,6 +282,30 @@ func (s *scheme) HostConn() (grpc.ClientConnInterface, bool) {
 	return s.Scheme.(workspace.PackageHost).HostConn()
 }
 
+// CreateVTE satisfies workspace.VTEOwner.
+func (s *scheme) CreateVTE(
+	ctx context.Context, opts workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	return s.Scheme.(workspace.VTEOwner).CreateVTE(ctx, opts)
+}
+
+// ListVTEs satisfies workspace.VTEOwner.
+func (s *scheme) ListVTEs(ctx context.Context) ([]workspace.VTEInfo, error) {
+	return s.Scheme.(workspace.VTEOwner).ListVTEs(ctx)
+}
+
+// AttachVTE satisfies workspace.VTEOwner.
+func (s *scheme) AttachVTE(
+	ctx context.Context, id workspace.VTEID,
+) (workspace.VTE, error) {
+	return s.Scheme.(workspace.VTEOwner).AttachVTE(ctx, id)
+}
+
+// DeleteVTE satisfies workspace.VTEOwner.
+func (s *scheme) DeleteVTE(ctx context.Context, id workspace.VTEID) error {
+	return s.Scheme.(workspace.VTEOwner).DeleteVTE(ctx, id)
+}
+
 // installRootTimeout bounds the PeerInfo round-trip so resolving the
 // install root against a peer that is asleep or gone fails over to the
 // caller's fallback instead of stalling extension startup.
@@ -316,9 +352,10 @@ func dialPeer(dialer Dialer, peer string) (*grpc.ClientConn, error) {
 
 // connScheme ties the lifetime of the gRPC connection to the scheme
 // built on top of it, so a reconnect does not leak the previous
-// connection's background goroutines.
+// connection's background goroutines. It embeds the terminal-owning
+// interface so the peer's terminals stay reachable through it.
 type connScheme struct {
-	schemeapi.Scheme
+	vtescheme.Scheme
 	conn *grpc.ClientConn
 }
 

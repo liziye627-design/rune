@@ -30,7 +30,6 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
-	sdkworkspacerpc "github.com/unstablebuild/rune-go-sdk/api/workspaceapi/workspacerpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -38,6 +37,7 @@ import (
 	"unstable.build/rune/internal/runenet"
 	"unstable.build/rune/internal/runenet/runenetpb"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
 	tworkspacerpc "unstable.build/rune/internal/workspace/workspacerpc"
 )
 
@@ -153,12 +153,20 @@ func TestConnectFailureReportsItsOwnError(t *testing.T) {
 		"the connect failure must survive its own cleanup: %v", err)
 }
 
-// dialerFunc adapts a function to Dialer.
+// dialerFunc adapts a function to Dialer. Attachments go through the
+// same function, with the peer name marked, so a test that cares can
+// tell them apart.
 type dialerFunc func(ctx context.Context, peer string) (net.Conn, error)
 
 func (f dialerFunc) Dial(ctx context.Context, peer string) (net.Conn, error) {
 	return f(ctx, peer)
 }
+
+func (f dialerFunc) DialAttachment(ctx context.Context, peer string) (net.Conn, error) {
+	return f(ctx, attachmentPeer(peer))
+}
+
+func attachmentPeer(peer string) string { return peer + ":attach" }
 
 func TestSchemeConnectsOverDialer(t *testing.T) {
 	dir := t.TempDir()
@@ -256,10 +264,7 @@ func servePeerScheme(
 	rpcServer := tworkspacerpc.NewServer(scheme,
 		tworkspacerpc.CommandAuthorizerFunc(
 			func(context.Context, workspaceapi.Cmd) error { return nil }))
-	sdkworkspacerpc.RegisterSchemeServer(grpcServer, rpcServer)
-	sdkworkspacerpc.RegisterFilesServer(grpcServer, rpcServer)
-	sdkworkspacerpc.RegisterExecutorServer(grpcServer, rpcServer)
-	sdkworkspacerpc.RegisterTerminalServer(grpcServer, rpcServer)
+	tworkspacerpc.RegisterServices(grpcServer, rpcServer)
 	for _, r := range register {
 		r(grpcServer)
 	}
@@ -271,6 +276,50 @@ func servePeerScheme(
 		_ = rpcServer.Stop()
 	})
 	return lis.Addr().String()
+}
+
+// A peer serves its terminals from the workspace server that owns
+// them, so a rune:// workspace must reach them through the terminal
+// service rather than treat the peer as a bare filesystem.
+func TestSchemeReachesPeerTerminals(t *testing.T) {
+	dir := t.TempDir()
+	t.Run("peer owning terminals", func(t *testing.T) {
+		peer := vtescheme.NewServer(peerFileScheme(t, "/"))
+		addr := servePeerScheme(t, peer)
+		dialer := dialerFunc(func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", addr)
+		})
+
+		uri, err := workspaceapi.ParseURI("rune://laptop" + dir)
+		require.NoError(t, err)
+		s, err := New(dialer)(context.Background(), config.NopConfig(), uri)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = s.Close() })
+		require.NoError(t, s.(workspace.RemoteScheme).WaitConnected(context.Background()))
+
+		infos, err := s.(workspace.VTEOwner).ListVTEs(context.Background())
+		require.NoError(t, err)
+		assert.Empty(t, infos)
+	})
+
+	t.Run("peer without terminals", func(t *testing.T) {
+		addr := servePeerScheme(t, peerFileScheme(t, "/"))
+		dialer := dialerFunc(func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", addr)
+		})
+
+		uri, err := workspaceapi.ParseURI("rune://laptop" + dir)
+		require.NoError(t, err)
+		s, err := New(dialer)(context.Background(), config.NopConfig(), uri)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = s.Close() })
+		require.NoError(t, s.(workspace.RemoteScheme).WaitConnected(context.Background()))
+
+		_, err = s.(workspace.VTEOwner).ListVTEs(context.Background())
+		assert.ErrorIs(t, err, workspace.ErrVTEUnsupported)
+	})
 }
 
 // staticPeerInfo advertises a fixed data directory, standing in for a

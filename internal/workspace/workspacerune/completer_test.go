@@ -18,6 +18,7 @@ package workspacerune
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -45,6 +46,10 @@ func (m stubMesh) Peers(context.Context) ([]runenet.Peer, error) {
 func (m stubMesh) Dial(ctx context.Context, _ string) (net.Conn, error) {
 	var d net.Dialer
 	return d.DialContext(ctx, "tcp", m.addr)
+}
+
+func (m stubMesh) DialAttachment(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("stubMesh: no attachments")
 }
 
 func drain(t *testing.T, it iterator.Iterator[string]) []string {

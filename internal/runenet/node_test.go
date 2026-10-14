@@ -449,6 +449,10 @@ func TestJoinIsStart(t *testing.T) {
 	assert.Equal(t, 1, changes, "a closed node has nothing left to report")
 }
 
+func TestAttachmentPort(t *testing.T) {
+	assert.Equal(t, DefaultPort+1, AttachmentPort(DefaultPort))
+}
+
 func TestSelfMachineID(t *testing.T) {
 	assert.Equal(t, "", selfMachineID(nil))
 	assert.Equal(t, "", selfMachineID(&ipnstate.Status{}))
