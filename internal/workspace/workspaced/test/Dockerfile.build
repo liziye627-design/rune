@@ -1,0 +1,13 @@
+# Builds the real rune for the e2e containers. The GUI's X11 and GL
+# headers are only needed to compile: the binary loads those libraries
+# at runtime, and never does in --headless, so the machines it runs on
+# need nothing but libc.
+#
+# The harness runs the build with the host's module cache mounted
+# read-only and the proxy off, so it needs neither network access nor
+# the credentials the private modules would.
+FROM golang:1.27-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+		libasound2-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
+		libxi-dev libxinerama-dev libxrandr-dev libxxf86vm-dev \
+	&& rm -rf /var/lib/apt/lists/*
