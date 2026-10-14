@@ -93,7 +93,7 @@ func TestHeadlessVTEHostIsInert(t *testing.T) {
 func TestNewVTERegistryRequiresAFactory(t *testing.T) {
 	t.Parallel()
 	assert.PanicsWithValue(t, "vtescheme: VTEFactory is required",
-		func() { NewVTERegistry(nil) })
+		func() { NewVTERegistry(nil, nil) })
 }
 
 // TestServerRefusesWhatItCannotServe pins what a client is told when

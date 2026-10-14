@@ -18,6 +18,7 @@ package vtescheme
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/ernestrc/go-multierror"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/term"
+	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/term/vte"
 	"unstable.build/rune/internal/workspace"
 	"unstable.build/rune/internal/workspace/vtewire"
@@ -55,20 +57,35 @@ type VTEFactory func(
 // terminal another workspace opened.
 type VTERegistry struct {
 	newVTE VTEFactory
+	// onChange is told that what Snapshot reports changed. It runs on
+	// whichever goroutine made the change, so it must return promptly.
+	onChange func()
 
 	mu      sync.Mutex
 	entries map[workspace.VTEID]*canonicalVTE
 }
 
 // NewVTERegistry allocates storage for a new VTERegistry and
-// initializes it with newVTE.
-func NewVTERegistry(newVTE VTEFactory) *VTERegistry {
+// initializes it with newVTE. onChange, when not nil, is called after
+// a terminal is created, terminated, attached to or detached from, and
+// when its process exits: every change to what [VTERegistry.Snapshot]
+// reports. It is called on whichever goroutine made the change and
+// may run concurrently with itself, so it must return promptly and
+// must coalesce on its own.
+func NewVTERegistry(newVTE VTEFactory, onChange func()) *VTERegistry {
 	if newVTE == nil {
 		panic("vtescheme: VTEFactory is required")
 	}
 	return &VTERegistry{
-		newVTE:  newVTE,
-		entries: make(map[workspace.VTEID]*canonicalVTE),
+		newVTE:   newVTE,
+		onChange: onChange,
+		entries:  make(map[workspace.VTEID]*canonicalVTE),
+	}
+}
+
+func (r *VTERegistry) changed() {
+	if r.onChange != nil {
+		r.onChange()
 	}
 }
 
@@ -97,6 +114,7 @@ func (r *VTERegistry) create(
 		height:      opts.Height,
 		attachments: make(map[*vteAttachment]struct{}),
 		hub:         newTeeHub(),
+		changed:     r.changed,
 	}
 	c.cell.store(cell)
 	h, err := r.newVTE(root, opts, c.cell.pixels)
@@ -122,6 +140,13 @@ func (r *VTERegistry) create(
 	r.mu.Lock()
 	r.entries[c.id] = c
 	r.mu.Unlock()
+	// The process ending is the one change nobody asks the registry
+	// for, so it is observed from the emulator's own stream.
+	go debug.CapturePanicReport(func() {
+		<-h.Component().Done()
+		r.changed()
+	})
+	r.changed()
 	return a, nil
 }
 
@@ -137,6 +162,7 @@ func (r *VTERegistry) AttachVTE(
 	if !ok {
 		return nil, workspace.ErrVTENotFound
 	}
+	r.changed()
 	return a, nil
 }
 
@@ -168,7 +194,26 @@ func (r *VTERegistry) DeleteVTE(
 	if !ok {
 		return workspace.ErrVTENotFound
 	}
-	return c.destroy()
+	err := c.destroy()
+	r.changed()
+	return err
+}
+
+// Snapshot reports every emulator the registry owns, keyed by the root
+// of the workspace it belongs to and ordered by creation.
+func (r *VTERegistry) Snapshot() map[string][]workspace.VTEInfo {
+	entries := r.snapshotEntries()
+	sort.Slice(entries, func(i, j int) bool {
+		if !entries[i].createdAt.Equal(entries[j].createdAt) {
+			return entries[i].createdAt.Before(entries[j].createdAt)
+		}
+		return entries[i].id < entries[j].id
+	})
+	ret := make(map[string][]workspace.VTEInfo)
+	for _, c := range entries {
+		ret[c.root] = append(ret[c.root], c.info())
+	}
+	return ret
 }
 
 func (r *VTERegistry) lookup(
@@ -199,6 +244,9 @@ func (r *VTERegistry) Close() error {
 	for _, c := range entries {
 		errs = multierror.Append(errs, c.destroy())
 	}
+	if len(entries) > 0 {
+		r.changed()
+	}
 	return errs.ErrorOrNil()
 }
 
@@ -224,6 +272,9 @@ type canonicalVTE struct {
 	createdAt time.Time
 	// hub fans the emulator's raw pty stream out to wire clients.
 	hub *teeHub
+	// changed reports a detach to the registry's observer; every other
+	// change is reported by the registry operation that made it.
+	changed func()
 	// cell is the size of a cell in pixels in force. It changes under
 	// mu, but the emulator reads it from its parse goroutine, which a
 	// resize holding mu waits on.
@@ -260,8 +311,8 @@ func (c *canonicalVTE) attach() (*vteAttachment, bool) {
 
 func (c *canonicalVTE) detach(a *vteAttachment) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, ok := c.attachments[a]; !ok {
+		c.mu.Unlock()
 		return
 	}
 	delete(c.attachments, a)
@@ -274,6 +325,8 @@ func (c *canonicalVTE) detach(a *vteAttachment) {
 			c.followLocked(heir)
 		}
 	}
+	c.mu.Unlock()
+	c.changed()
 }
 
 // nextResizeOwnerLocked picks the most recently focused remaining

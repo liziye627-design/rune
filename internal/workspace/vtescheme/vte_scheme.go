@@ -66,6 +66,22 @@ var (
 	_ Scheme = (*clientScheme)(nil)
 )
 
+// ServerOption configures a [Server].
+type ServerOption func(*serverOptions)
+
+type serverOptions struct {
+	onChange func()
+}
+
+// WithRegistryObserver has onChange called whenever what
+// [Server.Terminals] reports changes: a terminal was created,
+// terminated, attached to or detached from, or its process exited.
+// It runs on whichever goroutine made the change, so it must return
+// promptly and must not call back into the server.
+func WithRegistryObserver(onChange func()) ServerOption {
+	return func(o *serverOptions) { o.onChange = onChange }
+}
+
 // NewServer decorates inner so it owns terminal emulators: their
 // handlers, ptys, processes, rendered grids, scrollback and stable
 // identities. Closing it terminates every terminal, so it belongs to a
@@ -73,21 +89,27 @@ var (
 //
 // It hosts the terminals of every workspace under inner's root, each
 // reached through [Server.Chroot].
-func NewServer(inner schemeapi.Scheme) *Server {
+func NewServer(inner schemeapi.Scheme, opts ...ServerOption) *Server {
 	// A pty resize is driven from inside the emulator, so letting it
 	// run inline would let one wedged terminal stall every other
 	// terminal this server owns.
 	resizes := workspace.NewAsyncTerminal(inner, headlessVTEHost{})
-	s := newServer(inner, newSchemeVTEFactory(inner, resizes))
+	s := newServer(inner, newSchemeVTEFactory(inner, resizes), opts...)
 	s.resizes = resizes
 	return s
 }
 
-func newServer(inner schemeapi.Scheme, factory VTEFactory) *Server {
+func newServer(
+	inner schemeapi.Scheme, factory VTEFactory, opts ...ServerOption,
+) *Server {
+	var o serverOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	return &Server{
 		Scheme:   inner,
 		root:     filepath.Clean(inner.Root()),
-		registry: NewVTERegistry(factory),
+		registry: NewVTERegistry(factory, o.onChange),
 	}
 }
 
@@ -189,6 +211,12 @@ func (s *Server) AttachVTE(
 // DeleteVTE satisfies workspace.VTEOwner.
 func (s *Server) DeleteVTE(ctx context.Context, id workspace.VTEID) error {
 	return s.registry.DeleteVTE(ctx, s.root, id)
+}
+
+// Terminals reports every terminal this server owns, across every
+// workspace it hosts, keyed by workspace root.
+func (s *Server) Terminals() map[string][]workspace.VTEInfo {
+	return s.registry.Snapshot()
 }
 
 // Close terminates every terminal this server owns. A view owns
