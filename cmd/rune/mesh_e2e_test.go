@@ -19,7 +19,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,6 +142,35 @@ func TestSpawnedServerHostsTheNetwork(t *testing.T) {
 	assert.Equal(t, "beta", status.Network.Hostname)
 	require.Len(t, status.Network.Peers, 1)
 	assert.Equal(t, "alpha", status.Network.Peers[0].Hostname)
+
+	// And what the Dock does: a stop over the control socket ends the
+	// server the way a signal does, status and all.
+	assert.Equal(t, "ok", controlCommand(t, beta.dataDir, "stop"))
+	require.Eventually(t, func() bool {
+		lock, err := workspaceserver.AcquireLock(beta.dataDir)
+		if err != nil {
+			return false
+		}
+		_ = lock.Release()
+		return true
+	}, 30*time.Second, 50*time.Millisecond, "beta did not stop")
+	_, err = workspaced.ReadStatus(beta.dataDir)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// controlCommand sends one command to the server of dataDir over its
+// control socket and returns the reply line.
+func controlCommand(t *testing.T, dataDir, cmd string) string {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", workspaceserver.ControlSocketPath(dataDir), 5*time.Second)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	_, err = conn.Write([]byte(cmd + "\n"))
+	require.NoError(t, err)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Minute)))
+	reply, err := bufio.NewReader(conn).ReadString('\n')
+	require.NoError(t, err)
+	return strings.TrimSuffix(reply, "\n")
 }
 
 // headless is a spawned workspace server and the editor-side client

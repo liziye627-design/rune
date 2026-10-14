@@ -105,6 +105,13 @@ func TestStartFailsWithoutLeaking(t *testing.T) {
 			wantMsg: "already serving",
 		},
 		{
+			name: "the control socket is taken",
+			occupy: func(t *testing.T, dataDir string) {
+				listen(t, workspaceserver.ControlSocketPath(dataDir))
+			},
+			wantMsg: "already serving",
+		},
+		{
 			name: "the workspace socket is taken",
 			occupy: func(t *testing.T, dataDir string) {
 				listen(t, workspaceserver.SocketPath(dataDir))
@@ -127,9 +134,7 @@ func TestStartFailsWithoutLeaking(t *testing.T) {
 			assert.True(t, scheme.closed.Load(),
 				"a server that did not start still owns its scheme")
 			if tc.wantIs == nil {
-				lock, err := workspaceserver.AcquireLock(dataDir)
-				require.NoError(t, err, "a failed start must release the lock")
-				require.NoError(t, lock.Release())
+				requireLockFree(t, dataDir, "a failed start must release the lock")
 			}
 		})
 	}
@@ -225,9 +230,7 @@ func TestCloseReportsWhatItCouldNotRelease(t *testing.T) {
 				t.Fatal("a closed server is done")
 			}
 			assert.NoError(t, s.Err(), "a closed server did not stop on its own")
-			lock, err := workspaceserver.AcquireLock(dataDir)
-			require.NoError(t, err, "a closed server must not keep the lock")
-			require.NoError(t, lock.Release())
+			requireLockFree(t, dataDir, "a closed server must not keep the lock")
 		})
 	}
 }
@@ -275,11 +278,28 @@ func TestServerStopsWhenItsListenerFails(t *testing.T) {
 			require.ErrorIs(t, s.Err(), tc.wantIs)
 			assert.Contains(t, s.Err().Error(), tc.wantMsg)
 
-			lock, err := workspaceserver.AcquireLock(dataDir)
-			require.NoError(t, err, "a stopped server must not keep the lock")
-			require.NoError(t, lock.Release())
+			requireLockFree(t, dataDir, "a stopped server must not keep the lock")
 		})
 	}
+}
+
+// requireLockFree asserts that nothing holds the lock of dataDir. It
+// retries for a moment: a test running alongside that forks a terminal
+// hands the child every descriptor of this process until it execs,
+// the flock of a lock released in between included.
+func requireLockFree(t *testing.T, dataDir, msg string) {
+	t.Helper()
+	var err error
+	assert.Eventually(t, func() bool {
+		var lock *workspaceserver.Lock
+		lock, err = workspaceserver.AcquireLock(dataDir)
+		if err != nil {
+			return false
+		}
+		_ = lock.Release()
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+	require.NoError(t, err, msg)
 }
 
 func newScheme(t *testing.T, root string) schemeapi.Scheme {

@@ -171,6 +171,7 @@ func TestCloseReleasesEverything(t *testing.T) {
 	for _, path := range []string{
 		workspaceserver.SocketPath(dataDir),
 		workspaceserver.VTESocketPath(dataDir),
+		workspaceserver.ControlSocketPath(dataDir),
 		StatusPath(dataDir),
 	} {
 		_, err := os.Stat(path)

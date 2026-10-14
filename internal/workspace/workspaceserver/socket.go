@@ -78,6 +78,13 @@ func NetSocketPath(dataDir string) string {
 	return filepath.Join(SocketDir(dataDir), "rune.net.sock")
 }
 
+// ControlSocketPath returns the socket on which the workspace server
+// of dataDir takes one-line commands from processes that cannot speak
+// RPC to it, such as the Dock.
+func ControlSocketPath(dataDir string) string {
+	return filepath.Join(SocketDir(dataDir), "rune.ctl.sock")
+}
+
 // Listen binds the workspace server socket at path.
 //
 // A socket left behind by a server that died without unlinking it is

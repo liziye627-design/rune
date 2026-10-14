@@ -61,6 +61,9 @@ type Options struct {
 	// hosting process calls [Server.StatusChanged] when what it
 	// reports changes.
 	Network func() NetworkStatus
+	// Control is what the server lets a process without an RPC client
+	// do to it; see [Control].
+	Control Control
 }
 
 // Server is a running workspace server.
@@ -70,6 +73,7 @@ type Server struct {
 	rpc       *workspacerpc.Server
 	grpc      *grpc.Server
 	vteLis    net.Listener
+	ctlLis    net.Listener
 	cancel    context.CancelFunc
 	serving   sync.WaitGroup
 	done      chan struct{}
@@ -129,20 +133,33 @@ func Start(opts Options) (*Server, error) {
 		s.abort()
 		return nil, err
 	}
+	s.ctlLis, err = workspaceserver.Listen(workspaceserver.ControlSocketPath(opts.DataDir))
+	if err != nil {
+		_ = s.vteLis.Close()
+		s.abort()
+		return nil, err
+	}
 	lis, err := workspaceserver.Listen(workspaceserver.SocketPath(opts.DataDir))
 	if err != nil {
 		_ = s.vteLis.Close()
+		_ = s.ctlLis.Close()
 		s.abort()
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	s.serving.Add(2)
+	s.serving.Add(3)
 	go debug.CapturePanicReport(func() {
 		defer s.serving.Done()
 		if err := s.terminals.Serve(ctx, s.vteLis); err != nil {
 			s.fail(fmt.Errorf("serve terminal attachments: %w", err))
+		}
+	})
+	go debug.CapturePanicReport(func() {
+		defer s.serving.Done()
+		if err := serveControl(ctx, s.ctlLis, opts.Control); err != nil {
+			s.fail(fmt.Errorf("serve control: %w", err))
 		}
 	})
 	go debug.CapturePanicReport(func() {
@@ -230,6 +247,7 @@ func (s *Server) Close() error {
 		s.cancel()
 		s.grpc.Stop()
 		_ = s.vteLis.Close()
+		_ = s.ctlLis.Close()
 		s.serving.Wait()
 		_ = s.rpc.Stop()
 		s.closeErr = s.terminals.Close()

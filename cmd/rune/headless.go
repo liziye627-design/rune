@@ -121,11 +121,20 @@ func runHeadless(
 	// signal that lands in between must still stop it the clean way.
 	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
+	// A stop asked for over the control socket ends the wait below the
+	// way a signal does, so the server is torn down in the same order.
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	server, err := startMachineServer(shellRCDir, workspaced.Options{
 		RegisterServices: func(grpcServer *grpc.Server) {
 			mesh.server.Register(grpcServer)
 		},
 		Network: mesh.status,
+		Control: workspaced.Control{
+			NetworkUp:   mesh.Up,
+			NetworkDown: mesh.Down,
+			Stop:        stop,
+		},
 	})
 	if err != nil {
 		_ = mesh.Close()
