@@ -105,9 +105,12 @@ func EnsureImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("repo root: %v", err)
 	}
+	// The Dockerfile's COPY paths are relative to internal/, the same
+	// context build_docker.sh uses.
+	buildCtx := filepath.Join(root, "internal")
 	cmd := exec.Command("docker", "build",
-		"-f", filepath.Join(root, "workspace/workspacessh/test/Dockerfile"),
-		"-t", imageName, root)
+		"-f", filepath.Join(buildCtx, "workspace/workspacessh/test/Dockerfile"),
+		"-t", imageName, buildCtx)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -363,10 +366,15 @@ func containerGOARCH() string {
 // of using filepath.Abs("./testdata/<name>") directly.
 func PrivateKeyPath(t *testing.T, name string) string {
 	t.Helper()
-	src, err := filepath.Abs(filepath.Join("testdata", name))
+	// Resolved from the repository root rather than the working
+	// directory: the helper is exported, and a test package outside
+	// this directory has no testdata/ of its own.
+	root, err := repoRoot()
 	if err != nil {
-		t.Fatalf("abs key: %v", err)
+		t.Fatalf("repo root: %v", err)
 	}
+	src := filepath.Join(root, "internal", "workspace", "workspacessh", "test",
+		"testdata", name)
 	contents, err := os.ReadFile(src)
 	if err != nil {
 		t.Fatalf("read key %s: %v", src, err)

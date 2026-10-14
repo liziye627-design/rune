@@ -39,6 +39,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"unstable.build/rune/internal/debug"
+	"unstable.build/rune/internal/workspace"
 )
 
 var (
@@ -669,6 +670,60 @@ func (s *remoteScheme) broadcastDisconnect() {
 	s.disconnectOnce.Do(func() {
 		close(s.disconnectCh)
 	})
+}
+
+var _ workspace.VTEOwner = (*remoteScheme)(nil)
+
+// vteOwner resolves the terminals of the scheme the transport currently
+// provides. Attachments are bound to the transport that produced them,
+// but the emulators they point at are not: a reconnect resolves a new
+// scheme and clients reattach by the same [workspace.VTEID].
+func (s *remoteScheme) vteOwner() (workspace.VTEOwner, error) {
+	err, scheme := s.state()
+	if err != nil {
+		return nil, err
+	}
+	return workspace.AsVTEOwner(scheme)
+}
+
+// CreateVTE satisfies workspace.VTEOwner.
+func (s *remoteScheme) CreateVTE(
+	ctx context.Context, opts workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	o, err := s.vteOwner()
+	if err != nil {
+		return nil, err
+	}
+	return o.CreateVTE(ctx, opts)
+}
+
+// ListVTEs satisfies workspace.VTEOwner.
+func (s *remoteScheme) ListVTEs(ctx context.Context) ([]workspace.VTEInfo, error) {
+	o, err := s.vteOwner()
+	if err != nil {
+		return nil, err
+	}
+	return o.ListVTEs(ctx)
+}
+
+// AttachVTE satisfies workspace.VTEOwner.
+func (s *remoteScheme) AttachVTE(
+	ctx context.Context, id workspace.VTEID,
+) (workspace.VTE, error) {
+	o, err := s.vteOwner()
+	if err != nil {
+		return nil, err
+	}
+	return o.AttachVTE(ctx, id)
+}
+
+// DeleteVTE satisfies workspace.VTEOwner.
+func (s *remoteScheme) DeleteVTE(ctx context.Context, id workspace.VTEID) error {
+	o, err := s.vteOwner()
+	if err != nil {
+		return err
+	}
+	return o.DeleteVTE(ctx, id)
 }
 
 // wrap watcher to ensure that one of bluectx.First ctxs gets canceled

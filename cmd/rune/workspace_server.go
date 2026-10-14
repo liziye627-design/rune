@@ -37,10 +37,33 @@ import (
 	"unstable.build/rune/internal/llm/llmrpc"
 	"unstable.build/rune/internal/rpc"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
 	"unstable.build/rune/internal/workspace/workspaced"
 	"unstable.build/rune/internal/workspace/workspacerpc"
 	"unstable.build/rune/internal/workspace/workspacessh"
 )
+
+// runeExecutable is the binary a workspace server is started from. It
+// is this process: only rune knows it is rune, and a workspace server
+// must not be started from a binary that merely embeds the IDE.
+func runeExecutable() string {
+	path, err := os.Executable()
+	if err != nil {
+		log.Errorf("resolve rune binary: %v", err)
+	}
+	return path
+}
+
+// workspaceServerCommand starts this machine's workspace server on
+// demand. It is the same `rune --headless` an operator runs, told it
+// was spawned so that losing the start race to another server is not
+// an error: whoever spawned it connects to the winner.
+func workspaceServerCommand(dataDir, configPath string) []string {
+	return []string{
+		runeExecutable(), "--headless", "--daemon",
+		"--datadir", dataDir, "--config", configPath,
+	}
+}
 
 // startServerLog points the log at the workspace server log: nobody
 // reads the output of a server that runs over ssh or detached from any
@@ -103,12 +126,21 @@ func startWorkspaceServer(host *hostenv.Host, shellRCDir string, shellRCErr erro
 	if shellRCErr != nil {
 		reportRemoteShellRCErr(os.Stderr, shellRCErr)
 	}
-	scheme, err := workspace.NewFileSchemeFunc(*flagDataPath, shellRCDir)(
+	inner, err := workspace.NewFileSchemeFunc(*flagDataPath, shellRCDir)(
 		context.Background(), config.NopConfig(), uri)
 	if err != nil {
 		log.Error(err)
 		return 3
 	}
+	// This server dies with the ssh transport that spawned it, so it
+	// must not own terminals. It reaches this machine's workspace
+	// server instead, which is what lets a remote terminal survive a
+	// dropped connection.
+	scheme := vtescheme.NewClient(context.Background(), inner, uri,
+		vtescheme.ClientOptions{
+			DataDir: *flagDataPath,
+			Command: workspaceServerCommand(*flagDataPath, *flagConfigPath),
+		})
 	defer scheme.Close()
 	// Apply gui.env before serving so the tools the client starts here
 	// see the packages installed on this host.

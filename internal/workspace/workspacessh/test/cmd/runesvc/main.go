@@ -27,29 +27,52 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
+	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/ide/hostenv"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/vtescheme"
+	"unstable.build/rune/internal/workspace/workspaced"
 	"unstable.build/rune/internal/workspace/workspacerpc"
+	"unstable.build/rune/internal/workspace/workspaceserver"
 	"unstable.build/rune/internal/workspace/workspacessh"
 )
 
 func main() {
 	workspacePath := flag.String("x", "",
 		"local workspace path to expose over the workspace gRPC server")
+	headless := flag.Bool("headless", false,
+		"run this machine's workspace server, mirroring cmd/rune")
+	daemon := flag.Bool("daemon", false,
+		"exit quietly when another workspace server holds the lock")
 	dataDir := flag.String("datadir", "",
 		"data directory used by the workspace server")
+	vteBridge := flag.Bool("vte-bridge", false,
+		"bridge stdio to the terminal attachment socket of this "+
+			"machine's workspace server, starting it if none is")
 	flag.Parse()
+
+	home := resolveDataDir(*dataDir)
+	if *headless {
+		os.Exit(runHeadless(home, *daemon))
+	}
+	if *vteBridge {
+		os.Exit(runVTEBridge(home))
+	}
 
 	if *workspacePath == "" {
 		fmt.Fprintln(os.Stderr, "runesvc: -x <workspace-path> is required")
@@ -79,9 +102,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "runesvc: new file scheme:", err)
 		os.Exit(4)
 	}
-	defer scheme.Close()
+	// Same split as cmd/rune: this server dies with the ssh transport,
+	// so it only reaches the machine's workspace server, which owns the
+	// terminals.
+	client := vtescheme.NewClient(context.Background(), scheme, uri,
+		clientOptions(home))
+	defer client.Close()
 
-	server := workspacerpc.NewServer(scheme,
+	server := workspacerpc.NewServer(client,
 		workspacerpc.CommandAuthorizerFunc(
 			func(context.Context, workspaceapi.Cmd) error { return nil }))
 	defer func() { _ = server.Stop() }()
@@ -102,6 +130,63 @@ func main() {
 		fmt.Fprintln(os.Stderr, "runesvc: start scheme server:", err)
 		os.Exit(5)
 	}
+}
+
+// clientOptions starts this machine's workspace server the way cmd/rune
+// does: the same binary, asked to run headless as a daemon.
+func clientOptions(dataDir string) vtescheme.ClientOptions {
+	self, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runesvc: resolve executable:", err)
+		os.Exit(5)
+	}
+	return vtescheme.ClientOptions{
+		DataDir: dataDir,
+		Command: []string{self, "-headless", "-daemon", "-datadir", dataDir},
+	}
+}
+
+// runHeadless serves every workspace on this machine from one process,
+// mirroring cmd/rune's --headless.
+func runHeadless(dataDir string, daemon bool) int {
+	uri, err := workspaceapi.CurrentUserHostURI("/")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runesvc: root uri:", err)
+		return 2
+	}
+	scheme, err := workspace.NewFileScheme(
+		context.Background(), config.NopConfig(), uri)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runesvc: root scheme:", err)
+		return 3
+	}
+	server, err := workspaced.Start(workspaced.Options{
+		DataDir: dataDir,
+		Scheme:  scheme,
+	})
+	if daemon && errors.Is(err, workspaceserver.ErrLocked) {
+		return 0
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runesvc:", err)
+		return 1
+	}
+	defer func() { _ = server.Close() }()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-sigs:
+	case <-server.Done():
+	}
+	return 0
+}
+
+func resolveDataDir(dataDir string) string {
+	if dataDir != "" {
+		return dataDir
+	}
+	return defaultDataDir()
 }
 
 // sleepServeDelay blocks for the duration recorded in the remote data
@@ -152,4 +237,28 @@ func defaultDataDir() string {
 		return ""
 	}
 	return filepath.Join(home, ".rune")
+}
+
+// runVTEBridge joins stdio to the attachment socket of this machine's
+// workspace server, mirroring cmd/rune's --vte-bridge.
+func runVTEBridge(dataDir string) int {
+	conn, err := vtescheme.DialAttachment(context.Background(),
+		clientOptions(dataDir))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runesvc: dial terminal attachment:", err)
+		return 3
+	}
+	defer func() { _ = conn.Close() }()
+
+	done := make(chan struct{}, 2)
+	go debug.CapturePanicReport(func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = io.Copy(conn, os.Stdin)
+	})
+	go debug.CapturePanicReport(func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = io.Copy(os.Stdout, conn)
+	})
+	<-done
+	return 0
 }

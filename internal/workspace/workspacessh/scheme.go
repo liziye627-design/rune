@@ -41,6 +41,7 @@ import (
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/workspace"
 	"unstable.build/rune/internal/workspace/remotescheme"
+	"unstable.build/rune/internal/workspace/vtescheme"
 )
 
 const (
@@ -54,6 +55,12 @@ const (
 	// non-login shells that skip the profile files where
 	// distributions add ~/.local/bin.
 	remotePathEnv = `PATH="$HOME/.local/bin:$PATH"`
+
+	// remoteWorkspaceServerBin is the binary name we expect to find on
+	// the remote host. It is the `rune` binary started in workspace
+	// server mode (see cmd/rune/main.go: --workspace-server / -x) or
+	// as a terminal attachment bridge (--vte-bridge).
+	remoteWorkspaceServerBin = "rune"
 
 	debugPathError = "You can run %q to troubleshoot this. Also, double check your workspace.ssh.command " +
 		"and workspace.ssh.shell configuration, if you have any."
@@ -103,8 +110,11 @@ type remote interface {
 	Close() error
 }
 
-var _ workspace.RemoteScheme = (*scheme)(nil)
-var _ workspace.PackageHost = (*scheme)(nil)
+var (
+	_ workspace.RemoteScheme = (*scheme)(nil)
+	_ workspace.PackageHost  = (*scheme)(nil)
+	_ workspace.VTEOwner     = (*scheme)(nil)
+)
 
 type scheme struct {
 	cfg      sshConfig
@@ -316,11 +326,6 @@ func (s *scheme) workspaceExists(
 func (s *scheme) connectScheme(
 	ctx context.Context, uri workspaceapi.URI, closeHook func(error),
 ) (schemeapi.Scheme, error) {
-	// remoteWorkspaceServerBin is the binary name we expect to find on
-	// the remote host. It is the `rune` binary started in workspace
-	// server mode (see cmd/rune/main.go: --workspace-server / -x).
-	const remoteWorkspaceServerBin = "rune"
-
 	sshPath := s.basePath
 	if sshPath == "" {
 		sshPath = "."
@@ -513,15 +518,107 @@ func (s *scheme) connectScheme(
 		}
 	})
 
-	return connScheme{Scheme: workspacerpc.NewClient(s.ctx, conn), conn: conn}, nil
+	dial := func(context.Context) (io.ReadWriteCloser, error) {
+		return s.dialVTEBridge(remote, dataDirArgs)
+	}
+	client := vtescheme.NewConnClient(
+		workspacerpc.NewClient(s.ctx, conn), conn, dial)
+	return connScheme{Scheme: client, conn: conn}, nil
 }
 
 // connScheme exposes the gRPC connection the workspace client runs
 // on, so the host's other services are reached over the same pipe.
 // The client owns the connection.
 type connScheme struct {
-	schemeapi.Scheme
+	vtescheme.Scheme
 	conn *grpc.ClientConn
+}
+
+// dialVTEBridge opens one ssh channel carrying one terminal
+// attachment.
+//
+// The attachment protocol is a raw byte stream between a client's
+// emulator and a pty, so a channel running the remote bridge carries
+// it unchanged. Each attachment gets its own channel: they are
+// long-lived and independent, and a terminal producing output at full
+// rate must not delay the workspace's request/response traffic. The
+// bridge reaches the remote machine's workspace server, and the
+// attachment names its workspace in its own handshake.
+func (s *scheme) dialVTEBridge(
+	r remote, dataDirArgs []string,
+) (io.ReadWriteCloser, error) {
+	ses, err := r.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("new ssh session: %w", err)
+	}
+
+	cmdStr := remoteWorkspaceServerBin
+	args := append([]string{"--vte-bridge"}, dataDirArgs...)
+	if s.cfg.shell != "" {
+		args = append([]string{"-c", cmdStr}, args...)
+		cmdStr = s.cfg.shell
+	}
+	exited := make(chan error, 1)
+	cmd := workspaceapi.Cmd{
+		Path:    remotePathEnv + " " + cmdStr,
+		Args:    args,
+		Watcher: workspaceapi.ChanProcessWatcher(exited),
+	}
+
+	stdoutRead, stderrRead, stdinWrite, closers, err := setPipes(&cmd, os.Pipe)
+	if err != nil {
+		return nil, fmt.Errorf("could not create pipes: %w", err)
+	}
+	closeAll := func() {
+		for _, closer := range closers {
+			_ = closer.Close()
+		}
+	}
+	if _, err := ses.StartCommand(s.ctx, cmd); err != nil {
+		closeAll()
+		return nil, fmt.Errorf("start remote terminal bridge: %w", err)
+	}
+	// The session copies the bridge's output into these pipes but never
+	// closes them, so the attachment would not otherwise see the bridge
+	// end. Closing the write ends still lets it read what was written.
+	outputs := []any{cmd.Stdout, cmd.Stderr}
+	go debug.CapturePanicReport(func() {
+		select {
+		case <-exited:
+		case <-s.ctx.Done():
+		}
+		for _, w := range outputs {
+			if c, ok := w.(io.Closer); ok {
+				_ = c.Close()
+			}
+		}
+	})
+	// Nobody reads the bridge's stderr, and an unread pipe eventually
+	// blocks whatever writes to it.
+	go debug.CapturePanicReport(func() {
+		_, _ = io.Copy(io.Discard, stderrRead)
+	})
+
+	conn, err := newStdConn(log.StandardLogger(),
+		stdoutRead, stdinWrite, false /* stdio */, func() {})
+	if err != nil {
+		closeAll()
+		return nil, err
+	}
+	return &bridgeConn{Conn: conn, closeAll: closeAll}, nil
+}
+
+// bridgeConn closes the pipes backing one attachment channel when the
+// attachment ends.
+type bridgeConn struct {
+	net.Conn
+	closeAll func()
+}
+
+func (c *bridgeConn) Close() error {
+	err := c.Conn.Close()
+	c.closeAll()
+	return err
 }
 
 func (c connScheme) Conn() grpc.ClientConnInterface { return c.conn }
@@ -691,6 +788,30 @@ func (s *scheme) WaitConnected(ctx context.Context) error {
 // connection, following its reconnects.
 func (s *scheme) HostConn() (grpc.ClientConnInterface, bool) {
 	return s.Scheme.(workspace.PackageHost).HostConn()
+}
+
+// CreateVTE satisfies workspace.VTEOwner.
+func (s *scheme) CreateVTE(
+	ctx context.Context, opts workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	return s.Scheme.(workspace.VTEOwner).CreateVTE(ctx, opts)
+}
+
+// ListVTEs satisfies workspace.VTEOwner.
+func (s *scheme) ListVTEs(ctx context.Context) ([]workspace.VTEInfo, error) {
+	return s.Scheme.(workspace.VTEOwner).ListVTEs(ctx)
+}
+
+// AttachVTE satisfies workspace.VTEOwner.
+func (s *scheme) AttachVTE(
+	ctx context.Context, id workspace.VTEID,
+) (workspace.VTE, error) {
+	return s.Scheme.(workspace.VTEOwner).AttachVTE(ctx, id)
+}
+
+// DeleteVTE satisfies workspace.VTEOwner.
+func (s *scheme) DeleteVTE(ctx context.Context, id workspace.VTEID) error {
+	return s.Scheme.(workspace.VTEOwner).DeleteVTE(ctx, id)
 }
 
 func (s *scheme) expandPath(path string) (string, error) {

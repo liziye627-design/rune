@@ -24,8 +24,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/unstablebuild/blue/retry"
+	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"go.uber.org/mock/gomock"
@@ -384,6 +386,123 @@ func TestRemoteScheme(t *testing.T) {
 			t.Fatal("OnDisconnect channel must close on Close")
 		}
 	})
+}
+
+// TestRemoteSchemeTerminals pins that the terminals of a remote scheme
+// are those of the scheme its transport currently provides: it has none
+// when that scheme owns none, nor while it has no scheme at all.
+func TestRemoteSchemeTerminals(t *testing.T) {
+	uri, err := workspaceapi.ParseURI("ssh://unstable.build/home/ernie")
+	require.NoError(t, err)
+	refused := errors.New("connection refused")
+	memory := func(t *testing.T) schemeapi.Scheme {
+		memURI, err := workspaceapi.ParseURI("memory:///")
+		require.NoError(t, err)
+		s, err := workspace.NewMemoryScheme(context.Background(), config.NopConfig(), memURI)
+		require.NoError(t, err)
+		return s
+	}
+
+	for _, tc := range []struct {
+		name    string
+		connect func(t *testing.T) (schemeapi.Scheme, error)
+		closed  bool
+		wantIs  error
+	}{
+		{
+			name: "a scheme that owns terminals",
+			connect: func(t *testing.T) (schemeapi.Scheme, error) {
+				return terminalScheme{Scheme: memory(t)}, nil
+			},
+		},
+		{
+			name: "a scheme that owns none",
+			connect: func(t *testing.T) (schemeapi.Scheme, error) {
+				return memory(t), nil
+			},
+			wantIs: workspace.ErrVTEUnsupported,
+		},
+		{
+			name: "a transport that never connected",
+			connect: func(*testing.T) (schemeapi.Scheme, error) {
+				return nil, refused
+			},
+			wantIs: refused,
+		},
+		{
+			name: "a closed scheme",
+			connect: func(t *testing.T) (schemeapi.Scheme, error) {
+				return terminalScheme{Scheme: memory(t)}, nil
+			},
+			closed: true,
+			wantIs: ErrRemoteClosed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := New(context.Background(), func(
+				context.Context, workspaceapi.URI, func(error),
+			) (schemeapi.Scheme, error) {
+				return tc.connect(t)
+			}, uri, func(error) bool { return false })
+			t.Cleanup(func() { _ = scheme.Close() })
+			if tc.closed {
+				// Closing before the first attempt settles would race
+				// the connection it is making.
+				require.NoError(t, scheme.(workspace.RemoteScheme).
+					WaitConnected(context.Background()))
+				require.NoError(t, scheme.Close())
+			}
+			owner, ok := scheme.(workspace.VTEOwner)
+			require.True(t, ok)
+			ctx := context.Background()
+
+			_, createErr := owner.CreateVTE(ctx, workspace.CreateVTEOptions{})
+			infos, listErr := owner.ListVTEs(ctx)
+			_, attachErr := owner.AttachVTE(ctx, "attached")
+			deleteErr := owner.DeleteVTE(ctx, "deleted")
+			if tc.wantIs == nil {
+				assert.ErrorIs(t, createErr, errTerminalCreate)
+				assert.NoError(t, listErr)
+				assert.Equal(t, []workspace.VTEInfo{{ID: "listed"}}, infos)
+				assert.ErrorIs(t, attachErr, errTerminalAttach)
+				assert.ErrorIs(t, deleteErr, errTerminalDelete)
+				return
+			}
+			for _, err := range []error{createErr, listErr, attachErr, deleteErr} {
+				assert.ErrorIs(t, err, tc.wantIs)
+			}
+		})
+	}
+}
+
+var (
+	errTerminalCreate = errors.New("created by the connected scheme")
+	errTerminalAttach = errors.New("attached by the connected scheme")
+	errTerminalDelete = errors.New("deleted by the connected scheme")
+)
+
+// terminalScheme owns terminals, each operation answering in a way
+// only it could.
+type terminalScheme struct {
+	schemeapi.Scheme
+}
+
+func (terminalScheme) CreateVTE(
+	context.Context, workspace.CreateVTEOptions,
+) (workspace.VTE, error) {
+	return nil, errTerminalCreate
+}
+
+func (terminalScheme) ListVTEs(context.Context) ([]workspace.VTEInfo, error) {
+	return []workspace.VTEInfo{{ID: "listed"}}, nil
+}
+
+func (terminalScheme) AttachVTE(context.Context, workspace.VTEID) (workspace.VTE, error) {
+	return nil, errTerminalAttach
+}
+
+func (terminalScheme) DeleteVTE(context.Context, workspace.VTEID) error {
+	return errTerminalDelete
 }
 
 func expectSchemeAPISuccess(

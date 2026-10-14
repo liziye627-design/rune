@@ -102,6 +102,10 @@ var (
 		"Run --headless as a workspace server another Rune started on "+
 			"demand: log to the server log, and exit quietly when "+
 			"another instance already holds the lock")
+	flagVTEBridge = flag.Bool("vte-bridge", false,
+		"Bridge standard input and output to the terminal attachment "+
+			"socket of this machine's workspace server, starting it if "+
+			"none is running")
 	flagHTTPAddress = flag.String("rune-http-address", apicfg.HTTPEndpointAddress,
 		"Rune HTTP API endpoint host/port pair")
 	flagGRPCAddress = flag.String("rune-grpc-address", apicfg.GRPCEndpointAddress,
@@ -196,6 +200,9 @@ func main() {
 	if err := flag.CommandLine.MarkHidden("daemon"); err != nil {
 		panic(err)
 	}
+	if err := flag.CommandLine.MarkHidden("vte-bridge"); err != nil {
+		panic(err)
+	}
 	if err := flag.CommandLine.MarkHidden("rune-release-collection"); err != nil {
 		panic(err)
 	}
@@ -217,7 +224,7 @@ func main() {
 	// If no manual tui/gui flag was set, assume we were launched as a desktop
 	// app and inject the same defaults the platform launcher would normally pass.
 	if !*flagGUI && !*flagTUI && !*flagHeadless && !*flagDaemon &&
-		*flagWorkspaceServer == "" {
+		!*flagVTEBridge && *flagWorkspaceServer == "" {
 		if err := os.MkdirAll(*flagDataPath, 0777); err != nil {
 			fmt.Fprintf(os.Stderr, "mkdir datadir %q: %s",
 				*flagDataPath, err)
@@ -326,6 +333,11 @@ func checkModeArgs(
 			"only one of --gui, --tui or --headless can be passed at once, got %s",
 			strings.Join(modes, " "))
 	}
+	// The bridge is a mode of its own, which main runs ahead of the
+	// others: combined with one, the other would be silently ignored.
+	if fs.Changed("vte-bridge") && len(modes) > 0 {
+		return fmt.Errorf("--vte-bridge cannot be combined with %s", modes[0])
+	}
 	if !headless {
 		if fs.Changed("daemon") {
 			return errors.New("--daemon only applies to --headless")
@@ -398,6 +410,14 @@ func run() int {
 		}
 		code := startWorkspaceServer(host, shellRCDir, shellRCErr)
 		return code
+	}
+
+	if *flagVTEBridge {
+		if err := <-pathDone; err != nil {
+			log.Errorf("could not resolve login shell PATH; tools on "+
+				"it (e.g. homebrew, mise) may be unavailable: %v", err)
+		}
+		return runVTEBridge()
 	}
 
 	ctx := context.Background()

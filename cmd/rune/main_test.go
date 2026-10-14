@@ -74,6 +74,12 @@ func TestCheckModeArgs(t *testing.T) {
 			args:    []string{"--tui", "--daemon"},
 			wantErr: "--daemon only applies to --headless",
 		},
+		{name: "vte bridge an ssh transport runs", args: []string{"--vte-bridge", "-d", "/d"}},
+		{
+			name:    "vte bridge with a mode",
+			args:    []string{"--tui", "--vte-bridge"},
+			wantErr: "--vte-bridge cannot be combined with --tui",
+		},
 	}
 
 	for _, tt := range tests {
@@ -145,6 +151,7 @@ func parseModeFlags(
 	tuiFlag := fs.Bool("tui", false, "")
 	headlessFlag := fs.Bool("headless", false, "")
 	fs.Bool("daemon", false, "")
+	fs.Bool("vte-bridge", false, "")
 	fs.StringP("config", "c", "", "")
 	fs.StringP("datadir", "d", "", "")
 	fs.StringP("workspace", "w", "", "")

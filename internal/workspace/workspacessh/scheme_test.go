@@ -1128,6 +1128,53 @@ func TestStderrTailBounded(t *testing.T) {
 	assert.Contains(t, tail.String(), "0123456789abcdef", "recent lines must be retained")
 }
 
+// exitingBridgeRemote runs a terminal bridge that exits as soon as it
+// starts. Like an ssh session, it never closes the pipes it was given.
+type exitingBridgeRemote struct{}
+
+func (exitingBridgeRemote) NewSession() (schemeapi.Executor, error) {
+	return exitingBridgeExecutor{}, nil
+}
+
+func (exitingBridgeRemote) Close() error { return nil }
+
+type exitingBridgeExecutor struct{}
+
+func (exitingBridgeExecutor) StartCommand(
+	_ context.Context, cmd workspaceapi.Cmd,
+) (workspaceapi.Pid, error) {
+	if cmd.Watcher != nil && cmd.Watcher.WatchProcess() != nil {
+		go debug.CapturePanicReport(func() {
+			cmd.Watcher.WatchProcess() <- fmt.Errorf("exit status 1")
+		})
+	}
+	return 1, nil
+}
+
+func (exitingBridgeExecutor) Signal(workspaceapi.Pid, syscall.Signal) error { return nil }
+func (exitingBridgeExecutor) Close() error                                  { return nil }
+
+func TestVTEBridgeExitEndsTheAttachment(t *testing.T) {
+	s := new(scheme)
+	s.ctx, s.cancelCtx = context.WithCancel(context.Background())
+	defer s.cancelCtx()
+
+	conn, err := s.dialVTEBridge(exitingBridgeRemote{}, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+	read := make(chan error, 1)
+	go debug.CapturePanicReport(func() {
+		_, err := conn.Read(make([]byte, 1))
+		read <- err
+	})
+	select {
+	case err := <-read:
+		assert.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the attachment never saw its bridge exit")
+	}
+}
+
 // inlineSchedule is a synchronous workspace.ScheduleNextTick stub
 // that runs fn on the calling goroutine. Test-only: production code
 // must use the host event-loop scheduler so reload's buffer

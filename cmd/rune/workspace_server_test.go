@@ -33,6 +33,21 @@ import (
 	"unstable.build/rune/internal/workspace/workspaceserver"
 )
 
+func TestWorkspaceServerCommand(t *testing.T) {
+	self, err := os.Executable()
+	require.NoError(t, err)
+
+	got := workspaceServerCommand("/data", "/data/config.yaml")
+	assert.Equal(t, []string{self, "--headless", "--daemon",
+		"--datadir", "/data", "--config", "/data/config.yaml"}, got)
+	for _, arg := range got[1:] {
+		if name, ok := strings.CutPrefix(arg, "--"); ok {
+			assert.True(t, headlessFlags[name],
+				"--headless would reject the --%s it is spawned with", name)
+		}
+	}
+}
+
 // TestStartMachineServer pins the one server per data directory: it
 // serves every workspace of the machine, and a second one is refused
 // with the message an operator acts on.
