@@ -34,6 +34,7 @@ import (
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/runenet"
 	"unstable.build/rune/internal/runenet/meshrpc"
+	"unstable.build/rune/internal/workspace/workspaced"
 )
 
 // watchHost serves host's mesh service in memory and returns a client
@@ -190,4 +191,41 @@ func TestMeshHostStartAutoJoin(t *testing.T) {
 			assert.Equal(t, runenet.ErrSubscriptionRequired.Error(), st.LastError)
 		})
 	}
+}
+
+// The published status is read by processes that cannot ask again, so
+// a node that is not running is reported as such with its reason, and
+// an observer hears of every change the editors hear of.
+func TestMeshHostPublishedStatus(t *testing.T) {
+	api := &stubNetworkAPI{
+		user:     auth.RPCUser{Role: auth.RoleUser},
+		signedIn: true,
+		credErr:  runenet.ErrSubscriptionRequired,
+	}
+	cfg := config.MapConfig(map[string]any{
+		"network": map[string]any{"auto_join": true, "hostname": "laptop"},
+	})
+	host := newMeshHost(cfg, t.TempDir(), newNetworkGate(api), nil)
+	t.Cleanup(func() { _ = host.Close() })
+	changes := make(chan struct{}, 16)
+	host.observe(func() { changes <- struct{}{} })
+
+	assert.Equal(t, workspaced.NetworkStatus{
+		State:    runenet.StateNotRunning,
+		Hostname: "laptop",
+		Peers:    []workspaced.PeerStatus{},
+	}, host.status(), "a node that never started")
+
+	host.startAutoJoin()
+	select {
+	case <-changes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the failed join was not reported")
+	}
+	assert.Eventually(t, func() bool {
+		return host.status().LastError == runenet.ErrSubscriptionRequired.Error()
+	}, 5*time.Second, 10*time.Millisecond)
+	st := host.status()
+	assert.Equal(t, runenet.StateNotRunning, st.State)
+	assert.NotNil(t, st.Peers, "no peers is an empty list, not null")
 }

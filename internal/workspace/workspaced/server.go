@@ -28,7 +28,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
@@ -54,6 +56,11 @@ type Options struct {
 	// server before it starts serving. It is how the process hosting
 	// the server exposes what else it owns on the same socket.
 	RegisterServices func(*grpc.Server)
+	// Network, when set, reports the hosting process's membership in
+	// the Rune network for the [Status] the server publishes. The
+	// hosting process calls [Server.StatusChanged] when what it
+	// reports changes.
+	Network func() NetworkStatus
 }
 
 // Server is a running workspace server.
@@ -66,6 +73,9 @@ type Server struct {
 	cancel    context.CancelFunc
 	serving   sync.WaitGroup
 	done      chan struct{}
+	status    *statusWriter
+	network   func() NetworkStatus
+	startedAt time.Time
 
 	mu       sync.Mutex
 	serveErr error
@@ -94,9 +104,13 @@ func Start(opts Options) (*Server, error) {
 	}
 	s := &Server{
 		lock:      lock,
-		terminals: vtescheme.NewServer(opts.Scheme),
 		done:      make(chan struct{}),
+		network:   opts.Network,
+		startedAt: time.Now(),
 	}
+	s.status = newStatusWriter(StatusPath(opts.DataDir), statusDebounce, s.collectStatus)
+	s.terminals = vtescheme.NewServer(opts.Scheme,
+		vtescheme.WithRegistryObserver(s.status.Notify))
 	s.rpc = workspacerpc.NewServer(s.terminals, workspacerpc.CommandAuthorizerFunc(
 		func(context.Context, workspaceapi.Cmd) error { return nil }))
 	s.grpc = grpc.NewServer(append([]grpc.ServerOption{
@@ -137,6 +151,7 @@ func Start(opts Options) (*Server, error) {
 			s.fail(fmt.Errorf("serve workspaces: %w", err))
 		}
 	})
+	s.status.Notify()
 	return s, nil
 }
 
@@ -144,7 +159,30 @@ func Start(opts Options) (*Server, error) {
 func (s *Server) abort() {
 	_ = s.rpc.Stop()
 	_ = s.terminals.Close()
+	s.status.Close()
 	_ = s.lock.Release()
+}
+
+// StatusChanged tells the server that what [Options.Network] reports
+// changed, so the [Status] it publishes is rewritten.
+func (s *Server) StatusChanged() {
+	s.status.Notify()
+}
+
+func (s *Server) collectStatus() Status {
+	ret := Status{
+		Schema:     StatusSchema,
+		PID:        os.Getpid(),
+		StartedAt:  s.startedAt,
+		Workspaces: vteStatus(s.terminals.Terminals()),
+	}
+	if s.network != nil {
+		ret.Network = s.network()
+	}
+	if ret.Network.Peers == nil {
+		ret.Network.Peers = []PeerStatus{}
+	}
+	return ret
 }
 
 // Scheme is the machine's root scheme as this server serves it: the
@@ -195,6 +233,7 @@ func (s *Server) Close() error {
 		s.serving.Wait()
 		_ = s.rpc.Stop()
 		s.closeErr = s.terminals.Close()
+		s.status.Close()
 		if err := s.lock.Release(); err != nil && s.closeErr == nil {
 			s.closeErr = err
 		}

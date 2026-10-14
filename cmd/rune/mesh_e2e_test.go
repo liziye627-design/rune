@@ -42,6 +42,7 @@ import (
 	"unstable.build/rune/internal/term/vte"
 	"unstable.build/rune/internal/workspace"
 	"unstable.build/rune/internal/workspace/vtescheme"
+	"unstable.build/rune/internal/workspace/workspaced"
 	"unstable.build/rune/internal/workspace/workspacerune"
 	runetest "unstable.build/rune/internal/workspace/workspacerune/test"
 	"unstable.build/rune/internal/workspace/workspaceserver"
@@ -122,6 +123,23 @@ func TestSpawnedServerHostsTheNetwork(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, infos, 1)
 	assert.Equal(t, id, infos[0].ID)
+
+	// What the Dock reads: beta's server publishes the terminal it
+	// owns and the network it is on, without being asked.
+	var status workspaced.Status
+	require.Eventually(t, func() bool {
+		var err error
+		status, err = workspaced.ReadStatus(beta.dataDir)
+		return err == nil && len(status.Workspaces) == 1 &&
+			len(status.Workspaces[0].VTEs) == 1 &&
+			status.Workspaces[0].VTEs[0].Attachments == 0 &&
+			status.Network.State == runenet.StateRunning
+	}, 30*time.Second, 100*time.Millisecond, "status: %+v", &status)
+	assert.Equal(t, dir, status.Workspaces[0].Root)
+	assert.Equal(t, string(id), status.Workspaces[0].VTEs[0].ID)
+	assert.Equal(t, "beta", status.Network.Hostname)
+	require.Len(t, status.Network.Peers, 1)
+	assert.Equal(t, "alpha", status.Network.Peers[0].Hostname)
 }
 
 // headless is a spawned workspace server and the editor-side client

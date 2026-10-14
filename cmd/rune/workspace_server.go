@@ -219,10 +219,11 @@ func stopOnSignal(stop func()) func() {
 
 // startMachineServer starts the workspace server of this machine: every
 // workspace under "/" is served from one process, which is what keeps
-// their terminals alive beyond any Rune client. registerServices adds
-// what else this process serves on the same socket.
+// their terminals alive beyond any Rune client. opts carries what else
+// this process serves and reports; its data directory, scheme and RPC
+// options are this process's.
 func startMachineServer(
-	shellRCDir string, registerServices func(*grpc.Server),
+	shellRCDir string, opts workspaced.Options,
 ) (*workspaced.Server, error) {
 	uri, err := workspaceapi.CurrentUserHostURI("/")
 	if err != nil {
@@ -233,10 +234,8 @@ func startMachineServer(
 	if err != nil {
 		return nil, fmt.Errorf("root workspace scheme: %w", err)
 	}
-	return workspaced.Start(workspaced.Options{
-		DataDir:          *flagDataPath,
-		Scheme:           scheme,
-		ServerOptions:    workspaceServerOptions(),
-		RegisterServices: registerServices,
-	})
+	opts.DataDir = *flagDataPath
+	opts.Scheme = scheme
+	opts.ServerOptions = workspaceServerOptions()
+	return workspaced.Start(opts)
 }

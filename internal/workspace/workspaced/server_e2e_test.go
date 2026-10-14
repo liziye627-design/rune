@@ -107,6 +107,35 @@ func TestServerServesEveryWorkspace(t *testing.T) {
 				assert.Empty(t, infos)
 			},
 		},
+		{
+			name: "terminals in the published status",
+			run: func(t *testing.T) {
+				v, err := newClient(t, beta, dataDir).CreateVTE(vteCtx(ctx),
+					workspace.CreateVTEOptions{
+						CommandAndArgs: []string{"cat"},
+						Width:          20, Height: 10,
+					})
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = v.Close() })
+
+				var status Status
+				require.Eventually(t, func() bool {
+					var err error
+					status, err = ReadStatus(dataDir)
+					return err == nil && len(status.Workspaces) == 2 &&
+						status.Workspaces[1].Root == beta &&
+						len(status.Workspaces[1].VTEs) == 1 &&
+						status.Workspaces[1].VTEs[0].Attachments == 1
+				}, 5*time.Second, 10*time.Millisecond, "status: %+v", &status)
+				assert.Equal(t, alpha, status.Workspaces[0].Root)
+				assert.Zero(t, status.Workspaces[0].VTEs[0].Attachments,
+					"the previous client detached")
+				vte := status.Workspaces[1].VTEs[0]
+				assert.Equal(t, string(v.ID()), vte.ID)
+				assert.Equal(t, []string{"cat"}, vte.CommandAndArgs)
+				assert.False(t, vte.Complete)
+			},
+		},
 	} {
 		t.Run(tc.name, tc.run)
 	}
@@ -142,6 +171,7 @@ func TestCloseReleasesEverything(t *testing.T) {
 	for _, path := range []string{
 		workspaceserver.SocketPath(dataDir),
 		workspaceserver.VTESocketPath(dataDir),
+		StatusPath(dataDir),
 	} {
 		_, err := os.Stat(path)
 		assert.ErrorIs(t, err, os.ErrNotExist, "%s must be gone", path)

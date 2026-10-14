@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	sdkrpc "github.com/unstablebuild/rune-go-sdk/api/workspaceapi/workspacerpc"
+	"unstable.build/rune/internal/workspace/workspaced"
 	"unstable.build/rune/internal/workspace/workspaceserver"
 )
 
@@ -70,7 +71,7 @@ func TestStartMachineServer(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(ws, "hello.txt"), []byte("hi"), 0o644))
 	setFlagForTest(t, flagDataPath, dataDir)
 
-	server, err := startMachineServer("", nil)
+	server, err := startMachineServer("", workspaced.Options{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = server.Close() })
 
@@ -84,7 +85,7 @@ func TestStartMachineServer(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), info.Size())
 
-	_, err = startMachineServer("", nil)
+	_, err = startMachineServer("", workspaced.Options{})
 	require.ErrorIs(t, err, workspaceserver.ErrLocked)
 	assert.Contains(t, err.Error(), "there's another instance of Rune holding the lock")
 }

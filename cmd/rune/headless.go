@@ -43,6 +43,7 @@ import (
 	"unstable.build/rune/internal/runenet"
 	"unstable.build/rune/internal/runenet/meshdial"
 	"unstable.build/rune/internal/workspace"
+	"unstable.build/rune/internal/workspace/workspaced"
 	"unstable.build/rune/internal/workspace/workspaceserver"
 )
 
@@ -120,8 +121,11 @@ func runHeadless(
 	// signal that lands in between must still stop it the clean way.
 	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
-	server, err := startMachineServer(shellRCDir, func(grpcServer *grpc.Server) {
-		mesh.server.Register(grpcServer)
+	server, err := startMachineServer(shellRCDir, workspaced.Options{
+		RegisterServices: func(grpcServer *grpc.Server) {
+			mesh.server.Register(grpcServer)
+		},
+		Network: mesh.status,
 	})
 	if err != nil {
 		_ = mesh.Close()
@@ -140,6 +144,7 @@ func runHeadless(
 	defer func() {
 		_ = mesh.Close()
 	}()
+	mesh.observe(server.StatusChanged)
 	log.Infof("serving this machine's workspaces on %s",
 		workspaceserver.SocketPath(*flagDataPath))
 

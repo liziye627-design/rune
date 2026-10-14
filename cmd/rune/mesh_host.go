@@ -33,6 +33,7 @@ import (
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/runenet"
 	"unstable.build/rune/internal/runenet/meshrpc"
+	"unstable.build/rune/internal/workspace/workspaced"
 )
 
 // meshHost is the machine's network node as the workspace server hosts
@@ -59,6 +60,9 @@ type meshHost struct {
 	gated    bool
 	autoJoin bool
 	dataDir  string
+	// observer is told, after the editors, that the node's status or
+	// peers changed. It is what keeps the published status current.
+	observer atomic.Pointer[func()]
 
 	mu     sync.Mutex
 	scheme schemeapi.Scheme
@@ -103,8 +107,66 @@ func newMeshHost(
 	ret.server = meshrpc.NewServer(ret, func(context.Context) bool {
 		return ret.removed.Load()
 	})
-	cfg.OnChange = ret.server.Notify
+	cfg.OnChange = ret.notify
 	ret.node = runenet.New(cfg)
+	return ret
+}
+
+// notify tells everyone watching the node that it changed.
+func (h *meshHost) notify() {
+	h.server.Notify()
+	if fn := h.observer.Load(); fn != nil {
+		(*fn)()
+	}
+}
+
+// observe has fn called whenever the node's status or peers change,
+// on whichever goroutine saw the change.
+func (h *meshHost) observe(fn func()) {
+	h.observer.Store(&fn)
+}
+
+// statusTimeout bounds the node's answer for the published status,
+// which is collected off a timer and must not hold it up.
+const statusTimeout = 5 * time.Second
+
+// status is the node's membership as the workspace server publishes
+// it. A node that cannot answer is reported as not running with the
+// reason, since whoever reads the file cannot ask again.
+func (h *meshHost) status() workspaced.NetworkStatus {
+	ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
+	defer cancel()
+	st, err := h.node.Status(ctx)
+	if err != nil {
+		return workspaced.NetworkStatus{
+			State:     runenet.StateNotRunning,
+			LastError: err.Error(),
+			Peers:     []workspaced.PeerStatus{},
+		}
+	}
+	ret := workspaced.NetworkStatus{
+		State:     st.State,
+		Hostname:  st.Hostname,
+		LoginName: st.LoginName,
+		LastError: st.LastError,
+		AuthURL:   st.AuthURL,
+		Peers:     []workspaced.PeerStatus{},
+	}
+	if st.State == runenet.StateNotRunning {
+		return ret
+	}
+	peers, err := h.node.Peers(ctx)
+	if err != nil {
+		return ret
+	}
+	for _, p := range peers {
+		ret.Peers = append(ret.Peers, workspaced.PeerStatus{
+			Hostname: p.Hostname,
+			DNSName:  p.DNSName,
+			OS:       p.OS,
+			Online:   p.Online,
+		})
+	}
 	return ret
 }
 
@@ -152,7 +214,7 @@ func (h *meshHost) handleNeedsLogin(ctx context.Context, machineID string) {
 	}
 	if machineRemoved(machineID, machines) {
 		h.removed.Store(true)
-		h.server.Notify()
+		h.notify()
 		return
 	}
 	if err := h.Up(ctx); err != nil {
@@ -260,7 +322,7 @@ func (h *meshHost) Rejoin(ctx context.Context) error {
 // registered clears a removal once the machine is a member again.
 func (h *meshHost) registered() {
 	if h.removed.Swap(false) {
-		h.server.Notify()
+		h.notify()
 	}
 }
 
