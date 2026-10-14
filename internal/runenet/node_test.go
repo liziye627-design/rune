@@ -339,6 +339,116 @@ func TestEnteredNeedsLogin(t *testing.T) {
 	}
 }
 
+func TestHandleNotify(t *testing.T) {
+	state := func(s ipn.State) *ipn.State { return &s }
+	cases := []struct {
+		name        string
+		prev        ipn.State
+		notify      ipn.Notify
+		wantChange  bool
+		wantLogin   bool
+		wantState   ipn.State
+		noCallbacks bool
+	}{
+		{
+			name:       "state transition",
+			prev:       ipn.Starting,
+			notify:     ipn.Notify{State: state(ipn.Running)},
+			wantChange: true,
+			wantState:  ipn.Running,
+		},
+		{
+			name:       "logged out",
+			prev:       ipn.Running,
+			notify:     ipn.Notify{State: state(ipn.NeedsLogin)},
+			wantChange: true,
+			wantLogin:  true,
+			wantState:  ipn.NeedsLogin,
+		},
+		{
+			name:       "peer came online",
+			prev:       ipn.Running,
+			notify:     ipn.Notify{PeerChangedPatch: []*tailcfg.PeerChange{{}}},
+			wantChange: true,
+			wantState:  ipn.Running,
+		},
+		{
+			name:       "peer added",
+			prev:       ipn.Running,
+			notify:     ipn.Notify{PeersChanged: []*tailcfg.Node{{}}},
+			wantChange: true,
+			wantState:  ipn.Running,
+		},
+		{
+			name:       "peer removed",
+			prev:       ipn.Running,
+			notify:     ipn.Notify{PeersRemoved: []tailcfg.NodeID{1}},
+			wantChange: true,
+			wantState:  ipn.Running,
+		},
+		{
+			name:       "own record changed",
+			prev:       ipn.Running,
+			notify:     ipn.Notify{SelfChange: &tailcfg.Node{}},
+			wantChange: true,
+			wantState:  ipn.Running,
+		},
+		{
+			name:      "engine stats are not a change",
+			prev:      ipn.Running,
+			notify:    ipn.Notify{Engine: &ipn.EngineStatus{}},
+			wantState: ipn.Running,
+		},
+		{
+			name:        "callbacks are optional",
+			prev:        ipn.Running,
+			notify:      ipn.Notify{State: state(ipn.NeedsLogin)},
+			wantState:   ipn.NeedsLogin,
+			noCallbacks: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			changes, logins := 0, 0
+			cfg := Config{Hostname: "workstation", Port: DefaultPort, Dir: t.TempDir()}
+			if !tc.noCallbacks {
+				cfg.OnChange = func() { changes++ }
+				cfg.OnNeedsLogin = func() { logins++ }
+			}
+			node := New(cfg)
+			t.Cleanup(func() { _ = node.Close() })
+
+			got := node.handleNotify(tc.prev, &tc.notify)
+			assert.Equal(t, tc.wantState, got)
+			assert.Equal(t, tc.wantChange, changes == 1, "changes=%d", changes)
+			assert.Equal(t, tc.wantLogin, logins == 1, "logins=%d", logins)
+		})
+	}
+}
+
+func TestJoinIsStart(t *testing.T) {
+	changes := 0
+	node := New(Config{
+		Hostname: "workstation",
+		Port:     DefaultPort,
+		Dir:      t.TempDir(),
+		Credentials: func(context.Context) (string, string, error) {
+			return "", "", ErrNotAuthenticated
+		},
+		OnChange: func() { changes++ },
+	})
+	t.Cleanup(func() { _ = node.Close() })
+	assert.True(t, errors.Is(node.Join(context.Background()), ErrNotAuthenticated))
+	assert.Equal(t, 1, changes)
+	st, err := node.Status(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, ErrNotAuthenticated.Error(), st.LastError)
+
+	require.NoError(t, node.Close())
+	assert.ErrorIs(t, node.Join(context.Background()), ErrNotStarted)
+	assert.Equal(t, 1, changes, "a closed node has nothing left to report")
+}
+
 func TestSelfMachineID(t *testing.T) {
 	assert.Equal(t, "", selfMachineID(nil))
 	assert.Equal(t, "", selfMachineID(&ipnstate.Status{}))

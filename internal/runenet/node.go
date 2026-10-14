@@ -168,6 +168,16 @@ func New(cfg Config) *Node {
 // ctx bounds the credentials round-trip only; the join itself outlives
 // it.
 func (n *Node) Start(ctx context.Context) error {
+	err := n.start(ctx)
+	if err != nil && !errors.Is(err, ErrNotStarted) {
+		// Status reports the failure from now on, which is a change
+		// the bus never carries: the backend never moved.
+		n.changed()
+	}
+	return err
+}
+
+func (n *Node) start(ctx context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.closed {
@@ -219,10 +229,24 @@ func (n *Node) Start(ctx context.Context) error {
 				Warnf("could not join network: %v", err)
 		}
 	})
-	if n.cfg.OnNeedsLogin != nil {
+	if n.cfg.OnNeedsLogin != nil || n.cfg.OnChange != nil {
 		go debug.CapturePanicReport(func() { n.watchBackendState(upCtx) })
 	}
 	return nil
+}
+
+// Join brings the node online without waiting for membership. It is
+// [Node.Start] under the name the mesh API uses: a caller that wants to
+// block until this machine is a member calls [Node.Up] instead.
+func (n *Node) Join(ctx context.Context) error {
+	return n.Start(ctx)
+}
+
+// changed tells the OnChange subscriber something moved.
+func (n *Node) changed() {
+	if n.cfg.OnChange != nil {
+		n.cfg.OnChange()
+	}
 }
 
 // watchBackendState follows the backend's state over the IPN bus so
@@ -249,7 +273,11 @@ func (n *Node) readBackendState(ctx context.Context, prev ipn.State) ipn.State {
 	if err != nil {
 		return prev
 	}
-	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
+	// Peer deltas are asked for as well as the state: a peer coming
+	// online or going away is a netmap update, never a state change,
+	// and without the opt-in the bus does not carry them at all.
+	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState|
+		ipn.NotifyPeerPatches|ipn.NotifyRateLimit)
 	if err != nil {
 		return prev
 	}
@@ -259,14 +287,32 @@ func (n *Node) readBackendState(ctx context.Context, prev ipn.State) ipn.State {
 		if err != nil {
 			return prev
 		}
-		if notify.State == nil {
-			continue
-		}
-		if enteredNeedsLogin(prev, *notify.State) {
-			n.cfg.OnNeedsLogin()
-		}
-		prev = *notify.State
+		prev = n.handleNotify(prev, &notify)
 	}
+}
+
+// handleNotify dispatches one bus notification to the configured
+// callbacks and returns the backend state after it.
+func (n *Node) handleNotify(prev ipn.State, notify *ipn.Notify) ipn.State {
+	if notifyChanged(notify) {
+		n.changed()
+	}
+	if notify.State == nil {
+		return prev
+	}
+	if n.cfg.OnNeedsLogin != nil && enteredNeedsLogin(prev, *notify.State) {
+		n.cfg.OnNeedsLogin()
+	}
+	return *notify.State
+}
+
+// notifyChanged reports whether notify carries something Status or
+// Peers would answer differently after: the backend state, this node's
+// own record, or a peer added, patched or removed.
+func notifyChanged(notify *ipn.Notify) bool {
+	return notify.State != nil || notify.SelfChange != nil ||
+		len(notify.PeersChanged) > 0 || len(notify.PeersRemoved) > 0 ||
+		len(notify.PeerChangedPatch) > 0
 }
 
 // enteredNeedsLogin reports whether the backend just moved into
@@ -280,13 +326,20 @@ func enteredNeedsLogin(prev, next ipn.State) bool {
 // recordJoin stores the outcome of a join attempt for Status to
 // report; success clears earlier failures. Attempts cut short by Close
 // are discarded: "context canceled" explains nothing about the mesh.
+//
+// The outcome is reported to the OnChange subscriber as well as
+// through the bus, because a failed join never reaches the bus: the
+// backend's state does not change when the coordination server turns
+// the machine away.
 func (n *Node) recordJoin(err error) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if n.closed {
+		n.mu.Unlock()
 		return
 	}
 	n.lastErr = err
+	n.mu.Unlock()
+	n.changed()
 }
 
 // Up joins the mesh, starting the node first if needed, and blocks

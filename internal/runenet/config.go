@@ -71,6 +71,13 @@ type Config struct {
 	// from the account looks like from here. It runs on a background
 	// goroutine and must not block.
 	OnNeedsLogin func()
+	// OnChange is called whenever the backend's state or its view of
+	// the mesh changes: the node joins or leaves, a peer comes online
+	// or goes away. It carries no detail; the receiver reads
+	// [Node.Status] and [Node.Peers] for the current picture. Closing
+	// the node is not reported. It may run on the goroutine of the
+	// call that made the change, so it must not block.
+	OnChange func()
 	// Port is the tailnet-side listening port. See DefaultPort.
 	Port int
 	// Dir is the data directory the node persists its identity under.
