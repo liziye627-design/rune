@@ -163,7 +163,7 @@ type ex struct {
 	tabAliases               *tabNameAliaser
 	newPluginHandler         func(int, ...string) (pluginHandler, error)
 	workspace                workspace.Workspace
-	terminal                 *asyncTerminal
+	terminal                 *workspace.AsyncTerminal
 	tasks                    *idetask.Manager
 	dispatchOnPreview        map[string]previewFunc
 	filepathCompleter        command.Completer
@@ -542,7 +542,7 @@ func (e *ex) doInit(
 	e.workspace = m
 	e.container = notifications.New(&e.comp, n.cfg)
 	e.notifications = n.new(uri, e.container)
-	e.terminal = newAsyncTerminal(m, e.notifications)
+	e.terminal = workspace.NewAsyncTerminal(m, e.notifications)
 	e.publishEvent = publishEvent
 	e.storage = storage
 	e.workspaceURI = uri

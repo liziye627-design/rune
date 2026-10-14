@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-package ide
+package workspace
 
 import (
 	"context"
@@ -28,7 +28,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
-	"unstable.build/rune/internal/workspace/workspacetest"
 )
 
 // blockingTerminal is a schemeapi.Terminal whose SetPtySize parks
@@ -61,8 +60,8 @@ func (b *blockingTerminal) NewPty(context.Context) (workspaceapi.Pty, error) {
 		return workspaceapi.Pty{}, b.newPtyErr
 	}
 	return workspaceapi.Pty{
-		Master: workspacetest.NewFile(),
-		Slave:  workspacetest.NewFile(),
+		Master: NewMemoryFile("master", 0, 0, nil, new(sync.Mutex)),
+		Slave:  NewMemoryFile("slave", 1, 0, nil, new(sync.Mutex)),
 	}, nil
 }
 
@@ -92,6 +91,26 @@ type resizeNotifications struct {
 	msgs []string
 }
 
+type nopNotifications struct{}
+
+func (nopNotifications) Notify(
+	browserapi.NotificationLevel, string, ...any,
+) (string, error) {
+	return "", nil
+}
+
+func (nopNotifications) NotifyOnce(
+	browserapi.NotificationLevel, string, ...any,
+) (string, error) {
+	return "", nil
+}
+
+func (nopNotifications) UpdateNotificationProgress(
+	string, string, int64, int64,
+) error {
+	return nil
+}
+
 func (r *resizeNotifications) Notify(
 	_ browserapi.NotificationLevel, msg string, args ...any,
 ) (string, error) {
@@ -110,7 +129,7 @@ func (r *resizeNotifications) notified() []string {
 func TestAsyncTerminal(t *testing.T) {
 	t.Run("SetPtySize returns while the wrapped call is blocked", func(t *testing.T) {
 		wrapped := newBlockingTerminal()
-		at := newAsyncTerminal(wrapped, nopNotifications{})
+		at := NewAsyncTerminal(wrapped, nopNotifications{})
 		defer at.Close()
 
 		done := make(chan error, 1)
@@ -149,7 +168,7 @@ func TestAsyncTerminal(t *testing.T) {
 
 	t.Run("SetPtySize stays non-blocking past the queue capacity", func(t *testing.T) {
 		wrapped := newBlockingTerminal()
-		at := newAsyncTerminal(wrapped, nopNotifications{})
+		at := NewAsyncTerminal(wrapped, nopNotifications{})
 		defer at.Close()
 
 		for i := range asyncTerminalResizeQueue * 3 {
@@ -168,7 +187,7 @@ func TestAsyncTerminal(t *testing.T) {
 
 	t.Run("NewPty delegates synchronously", func(t *testing.T) {
 		wrapped := newBlockingTerminal()
-		at := newAsyncTerminal(wrapped, nopNotifications{})
+		at := NewAsyncTerminal(wrapped, nopNotifications{})
 		defer at.Close()
 
 		pty, err := at.NewPty(context.Background())
@@ -186,7 +205,7 @@ func TestAsyncTerminal(t *testing.T) {
 		wrapped.setSizeErr = errors.New("transport wedged")
 		close(wrapped.release)
 		notis := new(resizeNotifications)
-		at := newAsyncTerminal(wrapped, notis)
+		at := NewAsyncTerminal(wrapped, notis)
 		defer at.Close()
 
 		require.NoError(t, at.SetPtySize(workspaceapi.Pty{}, workspaceapi.PtySize{Columns: 80, Rows: 24}))
@@ -203,7 +222,7 @@ func TestAsyncTerminal(t *testing.T) {
 			"rpc error: code = Unknown desc = invalid master pty fd")
 		close(wrapped.release)
 		notis := new(resizeNotifications)
-		at := newAsyncTerminal(wrapped, notis)
+		at := NewAsyncTerminal(wrapped, notis)
 		defer at.Close()
 
 		require.NoError(t, at.SetPtySize(workspaceapi.Pty{}, workspaceapi.PtySize{Columns: 80, Rows: 24}))
@@ -215,7 +234,7 @@ func TestAsyncTerminal(t *testing.T) {
 
 	t.Run("Close does not wait for the in-flight RPC", func(t *testing.T) {
 		wrapped := newBlockingTerminal()
-		at := newAsyncTerminal(wrapped, nopNotifications{})
+		at := NewAsyncTerminal(wrapped, nopNotifications{})
 
 		require.NoError(t, at.SetPtySize(workspaceapi.Pty{}, workspaceapi.PtySize{Columns: 80, Rows: 24}))
 		select {

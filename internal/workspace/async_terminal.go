@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-package ide
+package workspace
 
 import (
 	"context"
@@ -26,7 +26,6 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"unstable.build/rune/internal/debug"
-	"unstable.build/rune/internal/workspace"
 )
 
 // asyncTerminalResizeQueue only has to hold the one resize that the
@@ -37,14 +36,18 @@ const asyncTerminalResizeQueue = 1
 // errInvalidMasterPtyFd is the message the workspace schemes report
 // once the master descriptor is gone. gRPC flattens it to an untyped
 // status error, so the message is all the client can match on.
-var errInvalidMasterPtyFd = workspace.ErrInvalidMasterPtyFd.Error()
+var errInvalidMasterPtyFd = ErrInvalidMasterPtyFd.Error()
 
 type ptyResize struct {
 	pty  workspaceapi.Pty
 	size workspaceapi.PtySize
 }
 
-type asyncTerminal struct {
+// AsyncTerminal decorates a terminal so resizing a pty never blocks
+// its caller. vte.Component.Resize drives SetPtySize inline, so
+// whoever owns an emulator would otherwise stall on the transport
+// behind every terminal it holds.
+type AsyncTerminal struct {
 	schemeapi.Terminal
 	notifications browserapi.Notifications
 
@@ -55,10 +58,12 @@ type asyncTerminal struct {
 	closing chan struct{}
 }
 
-func newAsyncTerminal(
+// NewAsyncTerminal allocates storage for a new AsyncTerminal around t
+// and starts its resize worker.
+func NewAsyncTerminal(
 	t schemeapi.Terminal, n browserapi.Notifications,
-) *asyncTerminal {
-	ret := &asyncTerminal{
+) *AsyncTerminal {
+	ret := &AsyncTerminal{
 		Terminal:      t,
 		notifications: n,
 		resizes:       make(chan ptyResize, asyncTerminalResizeQueue),
@@ -71,7 +76,7 @@ func newAsyncTerminal(
 
 // SetPtySize queues the resize and returns nil immediately. Transport
 // failures surface later, as a notification raised by the worker.
-func (t *asyncTerminal) SetPtySize(
+func (t *AsyncTerminal) SetPtySize(
 	p workspaceapi.Pty, size workspaceapi.PtySize,
 ) error {
 	req := ptyResize{pty: p, size: size}
@@ -93,7 +98,7 @@ func (t *asyncTerminal) SetPtySize(
 	return nil
 }
 
-func (t *asyncTerminal) offer(req ptyResize) bool {
+func (t *AsyncTerminal) offer(req ptyResize) bool {
 	select {
 	case t.resizes <- req:
 		return true
@@ -104,7 +109,7 @@ func (t *asyncTerminal) offer(req ptyResize) bool {
 
 // Close stops the resize worker. It does not wait for an in-flight
 // transport RPC; closing the underlying workspace unwinds that.
-func (t *asyncTerminal) Close() {
+func (t *AsyncTerminal) Close() {
 	select {
 	case t.closing <- struct{}{}:
 		close(t.stop)
@@ -112,7 +117,7 @@ func (t *asyncTerminal) Close() {
 	}
 }
 
-func (t *asyncTerminal) run() {
+func (t *AsyncTerminal) run() {
 	for {
 		// Checked before every dispatch so a resize queued before
 		// Close is not delivered once a blocked RPC unwinds.
@@ -143,30 +148,30 @@ func (t *asyncTerminal) run() {
 	}
 }
 
-// OnDisconnect forwards [workspace.RemoteScheme.OnDisconnect] when the
+// OnDisconnect forwards [RemoteScheme.OnDisconnect] when the
 // wrapped terminal is remote. Without it the decorator would hide the
 // optional interface from vtereservoir.New's type assertion and warm
 // VTEs would survive a dead transport.
-func (t *asyncTerminal) OnDisconnect() <-chan struct{} {
-	if rs, ok := t.Terminal.(workspace.RemoteScheme); ok {
+func (t *AsyncTerminal) OnDisconnect() <-chan struct{} {
+	if rs, ok := t.Terminal.(RemoteScheme); ok {
 		return rs.OnDisconnect()
 	}
 	return nil
 }
 
-// WaitConnected forwards [workspace.RemoteScheme.WaitConnected] when
+// WaitConnected forwards [RemoteScheme.WaitConnected] when
 // the wrapped terminal is remote, and is a no-op otherwise.
-func (t *asyncTerminal) WaitConnected(ctx context.Context) error {
-	if rs, ok := t.Terminal.(workspace.RemoteScheme); ok {
+func (t *AsyncTerminal) WaitConnected(ctx context.Context) error {
+	if rs, ok := t.Terminal.(RemoteScheme); ok {
 		return rs.WaitConnected(ctx)
 	}
 	return nil
 }
 
-func (t *asyncTerminal) log(level log.Level, msg string, args ...any) {
+func (t *AsyncTerminal) log(level log.Level, msg string, args ...any) {
 	if !log.IsLevelEnabled(level) {
 		return
 	}
-	log.WithField(logging.KeyClass, "ide.asyncTerminal").
+	log.WithField(logging.KeyClass, "workspace.AsyncTerminal").
 		Logf(level, msg, args...)
 }
