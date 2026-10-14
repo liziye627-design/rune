@@ -29,13 +29,11 @@ import (
 	"github.com/ernestrc/sensible/find"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/clipboard"
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"unstable.build/rune/internal/cell"
 	"unstable.build/rune/internal/component"
-	"unstable.build/rune/internal/term/programstatus"
 	"unstable.build/rune/internal/term/vte/vtescreen"
 	"unstable.build/rune/internal/term/vte/vtetest"
 	"unstable.build/rune/internal/text"
@@ -1979,23 +1977,3 @@ func (r *testRemote) flush() error {
 func (r *testRemote) triggerBell() error {
 	return nil
 }
-
-type nopTabManager struct {
-}
-
-func (nopTabManager) Tab(
-	uri workspaceapi.URI, icon rune, name string, h browserapi.Handler,
-) (browserapi.Handler, error) {
-	panic("not implemented")
-}
-
-func (nopTabManager) SetTabName(workspaceapi.URI, string, term.Attributes) error {
-	return nil
-}
-
-func (nopTabManager) OnTabExit(workspaceapi.URI) bool {
-	return false
-}
-
-func (nopTabManager) SetTabStatus(workspaceapi.URI, programstatus.Report) error { return nil }
-func (nopTabManager) EndTabStatus(workspaceapi.URI) error                       { return nil }

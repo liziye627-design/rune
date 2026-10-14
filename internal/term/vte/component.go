@@ -98,6 +98,8 @@ type Component struct {
 	// keyboard is the parser handler's, held here for the input path
 	// because ResetState rewrites the parser handler's fields.
 	keyboard      *keyboardState
+	relay         *graphicsRelay
+	tee           streamTee
 	complete      bool
 	selectionAttr term.Attributes
 	defAttr       term.Attributes
@@ -113,6 +115,14 @@ type Component struct {
 	// to request the frame after the next gap.
 	publisher browser.EventPublisher
 	animTimer *time.Timer
+
+	// done is closed when the pty stream ends, so observers learn the
+	// process exited without polling for it.
+	done     chan struct{}
+	doneOnce sync.Once
+	// exited is closed once exitErr is final, which may be after done.
+	exited     chan struct{}
+	exitedOnce sync.Once
 }
 
 // NOTE: this is an integrator implementation, it shouldn't really do much other
@@ -147,6 +157,8 @@ func (t *Component) Init(
 
 	t.ctx, t.cancelCtx = context.WithCancel(context.Background())
 	t.exitCh = make(chan error, 1)
+	t.done = make(chan struct{})
+	t.exited = make(chan struct{})
 	err := t.createPty(cfg.CommandAndArgs)
 	if err != nil {
 		return err
@@ -162,6 +174,8 @@ func (t *Component) Init(
 		cfg.CellPixelSize, cfg.FileSystem, cfg.TempDir)
 	t.parserHandler.clipboardAccess = cfg.ClipboardAccess
 	t.keyboard = t.parserHandler.keyboard
+	t.relay = t.parserHandler.relay
+	t.parserHandler.observer = cfg.Observer
 
 	// start with pty slave file name as title
 	var h vteparser.Handler = t.parserHandler
@@ -207,12 +221,9 @@ func (t *Component) Run(publisher browser.EventPublisher) error {
 	err := t.run(publisher)
 	if t.pid.Load() != 0 {
 		t.awaitExitStatus()
-		// What the process reported working or blocked on ends with it.
-		t.mu.Lock()
-		t.parserHandler.endStatus()
-		t.mu.Unlock()
-		_ = t.cfg.ScheduleNextTick(func() { t.tm.OnTabExit(t.uri) })
+		t.notifyTabExit()
 	}
+	t.markExited()
 	return err
 }
 
@@ -246,6 +257,27 @@ func (t *Component) ExitErr() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.exitErr
+}
+
+// Exited is closed once ExitErr is final: after Done, when Run stopped
+// waiting for the exit status or a replica was told it by MarkExited.
+func (t *Component) Exited() <-chan struct{} {
+	return t.exited
+}
+
+func (t *Component) markExited() {
+	t.exitedOnce.Do(func() { close(t.exited) })
+}
+
+// notifyTabExit pushes the process exit to the tab manager. Publishing
+// an event would only reach the focused handler, and the terminal
+// that exited is usually not the one in focus. What the process
+// reported working or blocked on ends with it.
+func (t *Component) notifyTabExit() {
+	t.mu.Lock()
+	t.parserHandler.endStatus()
+	t.mu.Unlock()
+	_ = t.cfg.ScheduleNextTick(func() { t.tm.OnTabExit(t.uri) })
 }
 
 // Title returns the Title of this Component.
@@ -919,6 +951,24 @@ func (t *Component) UsedAlternateBuffer() bool {
 	return t.parserHandler.usedAlternate()
 }
 
+// Done is closed once the emulator's byte stream ends, which happens
+// when its process exits or its pty is torn down.
+func (t *Component) Done() <-chan struct{} {
+	return t.done
+}
+
+// MarkComplete records that the terminal's process ended.
+//
+// A replica learns this from its stream rather than from a pty of its
+// own, and that stream stays open afterwards: the final output still
+// reflows when the terminal is resized.
+func (t *Component) MarkComplete() {
+	t.mu.Lock()
+	t.complete = true
+	t.mu.Unlock()
+	t.doneOnce.Do(func() { close(t.done) })
+}
+
 // ClearPrimaryBuffer clears the primary buffer of this Component.
 // If this Component is using the alternate buffer,
 // this method returns false.
@@ -1029,12 +1079,18 @@ func (t *Component) createPty(cmdAndArgs []string) error {
 		return fmt.Errorf("new pty: %w", t.spawnError(spawnCtx, err))
 	}
 
-	t.uri, err = workspaceapi.CurrentUserHostURI(pty.Slave.Name())
-	if err != nil {
-		return fmt.Errorf("pty URI: %v", err)
+	t.uri = t.cfg.URI
+	if t.uri.String() == "" {
+		t.uri, err = workspaceapi.CurrentUserHostURI(pty.Slave.Name())
+		if err != nil {
+			return fmt.Errorf("pty URI: %v", err)
+		}
 	}
 
 	t.pty = pty
+	if t.cfg.Observer {
+		return nil
+	}
 	if t.cfg.CommandExpander != nil {
 		return nil
 	}
@@ -1267,9 +1323,7 @@ func (t *Component) run(publisher browser.EventPublisher) error {
 	}
 
 	defer func() {
-		t.mu.Lock()
-		t.complete = true
-		t.mu.Unlock()
+		t.MarkComplete()
 	}()
 
 	if g, ok := newPtyGather(t.ctx, t.pty.Master); ok {
@@ -1282,8 +1336,7 @@ func (t *Component) run(publisher browser.EventPublisher) error {
 		if err != nil {
 			return err
 		}
-		t.parser.AdvanceBytes(buf[:n])
-		t.version.Add(1)
+		t.feed(buf[:n])
 		_ = publisher.PublishEvent(term.Event{Type: term.EventInterrupt})
 	}
 }
@@ -1293,9 +1346,8 @@ func (t *Component) run(publisher browser.EventPublisher) error {
 // the kernel pty queue.
 func (t *Component) runGather(g *ptyGather, publisher browser.EventPublisher) error {
 	for batch := range g.ready {
-		t.parser.AdvanceBytes(batch)
+		t.feed(batch)
 		g.release(batch)
-		t.version.Add(1)
 		_ = publisher.PublishEvent(term.Event{Type: term.EventInterrupt})
 	}
 	return g.err

@@ -1699,6 +1699,11 @@ func TestHandlerExitStatus(t *testing.T) {
 					"the terminal reported its exit before the status arrived")
 				require.Empty(t, h.tm.exits(),
 					"the terminal asked to be dropped before the status arrived")
+				select {
+				case <-h.handler.Component().Exited():
+					t.Fatal("the status was final before it arrived")
+				default:
+				}
 			}
 			if tc.closeWaiting {
 				require.NoError(t, h.handler.Close())
@@ -1723,6 +1728,11 @@ func TestHandlerExitStatus(t *testing.T) {
 			assert.Equal(t, tc.wantExitErr, h.handler.ExitErr())
 			assert.Equal(t, []error{tc.wantExitErr}, h.tm.exits(),
 				"the terminal must ask to be dropped once, with its status final")
+			select {
+			case <-h.handler.Component().Exited():
+			case <-time.After(5 * time.Second):
+				t.Fatal("the status is final but Exited was never closed")
+			}
 			assert.True(t, h.pub.sawEventNone(),
 				"the terminal must wake the event loop once it exited")
 			if tc.watched {
